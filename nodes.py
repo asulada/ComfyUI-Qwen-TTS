@@ -1747,6 +1747,8 @@ class SaveVoiceNode:
         except Exception as e:
             print(f"⚠️ [Qwen3-TTS] Failed to save metadata JSON: {e}")
 
+        wav_written = False
+
         # Optional: Save audio preview as reference WAV
         if audio is not None:
             try:
@@ -1764,11 +1766,21 @@ class SaveVoiceNode:
                     waveform_np = waveform_np[0].T
                 
                 sf.write(path_wav, waveform_np, sr)
+                wav_written = True
                 print(f"✅ [Qwen3-TTS] Reference audio (Speaker) saved to: {path_wav}")
             except Exception as e:
                 print(f"⚠️ [Qwen3-TTS] Failed to save reference audio: {e}")
+        else:
+            print(
+                "⚠️ [Qwen3-TTS] No 'audio' input connected: saved .qvp/.json only. "
+                "LoadSpeaker needs the .wav, so connect an AUDIO output (e.g. from the "
+                "VoiceClone/VoiceDesign node) to SaveVoice's 'audio' input."
+            )
 
-        print(f"💾 [Qwen3-TTS] Voice saved: {path_wav}")
+        if wav_written:
+            print(f"💾 [Qwen3-TTS] Voice saved: {path_qvp} (+ .json, .wav)")
+        else:
+            print(f"💾 [Qwen3-TTS] Voice saved: {path_qvp} (+ .json, no .wav)")
         return {}
 
 
