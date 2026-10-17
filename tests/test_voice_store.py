@@ -309,5 +309,41 @@ class MetadataPathTests(unittest.TestCase):
         self.assertEqual(meta["ref_text"], "hi")
 
 
+class SubfolderTests(unittest.TestCase):
+    """voices saved with SaveVoice(subfolder=...) must be listable and loadable."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.voices = os.path.join(self.root, "voices")
+        self.nested = os.path.join(self.voices, "verify", "batch1")
+        os.makedirs(self.nested)
+        open(os.path.join(self.voices, "top.wav"), "w").close()
+        open(os.path.join(self.nested, "saved_probe.wav"), "w").close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_recursive_listing_includes_subfolders(self):
+        displays = [d for d, _ in list_voice_files([self.voices])]
+        self.assertEqual(displays, ["voices/top.wav", "voices/verify/batch1/saved_probe.wav"])
+
+    def test_non_recursive_listing_skips_subfolders(self):
+        displays = [d for d, _ in list_voice_files([self.voices], recursive=False)]
+        self.assertEqual(displays, ["voices/top.wav"])
+
+    def test_resolve_label_with_nested_path(self):
+        path = resolve_input_path(
+            "voices/verify/batch1/saved_probe.wav", [self.voices], self.root
+        )
+        self.assertEqual(path, os.path.abspath(os.path.join(self.nested, "saved_probe.wav")))
+
+    def test_resolve_plain_relative_path(self):
+        path = resolve_input_path(
+            "verify/batch1/saved_probe.wav", [self.voices], self.root
+        )
+        self.assertEqual(path, os.path.abspath(os.path.join(self.nested, "saved_probe.wav")))
+
+
 if __name__ == "__main__":
     unittest.main()

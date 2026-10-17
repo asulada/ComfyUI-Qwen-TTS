@@ -97,11 +97,12 @@ def dir_label(path: str, models_dir: str) -> str:
     return name
 
 
-def list_voice_files(directories: Iterable[str]) -> List[Tuple[str, str]]:
+def list_voice_files(directories: Iterable[str], recursive: bool = True) -> List[Tuple[str, str]]:
     """Return ``(display_name, absolute_path)`` for every audio file found.
 
-    ``display_name`` is ``"<label>/<filename>"``.  Labels are de-duplicated so
-    two directories with the same base name stay distinguishable.
+    ``display_name`` is ``"<label>/<relative/path/file.wav>"``.  Sub-directories
+    created through SaveVoice's ``subfolder`` are included when ``recursive`` is
+    true, so they show up in the dropdown instead of becoming unreachable.
     """
     dirs = [d for d in directories if d and os.path.isdir(d)]
     if not dirs:
@@ -120,20 +121,29 @@ def list_voice_files(directories: Iterable[str]) -> List[Tuple[str, str]]:
     seen = set()
     for path, label in zip(dirs, base_labels):
         try:
-            names = sorted(os.listdir(path))
+            if recursive:
+                walker = (
+                    (root, files)
+                    for root, _dirs, files in os.walk(path)
+                )
+            else:
+                walker = [(path, os.listdir(path))]
         except OSError:
             continue
-        for name in names:
-            if not name.lower().endswith(AUDIO_EXTENSIONS):
-                continue
-            full = os.path.join(path, name)
-            if not os.path.isfile(full):
-                continue
-            key = _norm(full)
-            if key in seen:
-                continue
-            seen.add(key)
-            entries.append((f"{label}/{name}", full))
+
+        for root, names in walker:
+            for name in sorted(names):
+                if not name.lower().endswith(AUDIO_EXTENSIONS):
+                    continue
+                full = os.path.join(root, name)
+                if not os.path.isfile(full):
+                    continue
+                key = _norm(full)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rel = os.path.relpath(full, path).replace("\\", "/")
+                entries.append((f"{label}/{rel}", full))
 
     entries.sort(key=lambda item: item[0].lower())
     return entries
@@ -214,7 +224,9 @@ def resolve_input_path(
 
     Accepts:
       1. an absolute path to a file
-      2. a ``"<label>/<filename>"`` display name (what the dropdown yields)
+      2. ``"<label>/<relative/path/file.wav>"`` — the dropdown form, where the
+         label is a scanned directory and the rest may include sub-directories
+      3. a path relative to a scanned directory (e.g. ``"sub/file.wav"``)
 
     Bare filenames are handled by ``resolve_bare_name`` and must live in the
     default directory, so no cross-library guessing happens here.
@@ -231,11 +243,19 @@ def resolve_input_path(
     dirs = [d for d in directories if d and os.path.isdir(d)]
     label, name = split_display_name(text)
 
+    # 1. "<label>/<path>" — match the label, then join the remaining path.
     if label:
         for path in dirs:
             if dir_label(path, models_dir).lower() != label.lower():
                 continue
-            candidate = os.path.join(path, name)
+            candidate = os.path.join(path, *[p for p in name.split("/") if p not in ("", ".")])
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+
+        # A label can also be a sub-directory name; try it as a plain relative
+        # path before giving up (handles "verify/batch1/voice.wav").
+        for path in dirs:
+            candidate = os.path.join(path, *[p for p in text.split("/") if p not in ("", ".")])
             if os.path.isfile(candidate):
                 return os.path.abspath(candidate)
 
