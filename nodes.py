@@ -18,6 +18,8 @@ from .voice_store import (
     collect_voice_dirs,
     list_voice_files,
     build_filename_choices,
+    relative_voice_path,
+    resolve_bare_name,
     resolve_input_path,
     resolve_output_dir,
     sibling_metadata_paths,
@@ -1731,8 +1733,12 @@ class SaveVoiceNode:
         metadata = {
             "ref_text": ref_text.strip() if ref_text else "",
             "source": "SaveVoiceNode",
-            "version": "1.0",
+            "version": "1.1",
             "saved_path": path_wav,
+            # Relative to the owning voice directory, so a duplicate filename
+            # in another library still resolves to this exact file.
+            "relative_path": relative_voice_path(path_wav, target_root),
+            "voice_dir": target_root,
         }
         try:
             with open(path_json, "w", encoding="utf-8") as f:
@@ -1819,12 +1825,24 @@ class LoadSpeakerNode:
             )
 
         search_dirs = get_voice_search_dirs(directory)
-        try:
-            wav_path = resolve_input_path(chosen, search_dirs, folder_paths.models_dir)
-        except FileNotFoundError as e:
-            raise RuntimeError(
-                f"{e}. Scanned directories: {', '.join(search_dirs) or '(none)'}"
-            )
+        chosen_explicit = bool((file_path or "").strip())
+        is_bare = "/" not in chosen.replace("\\", "/") and not os.path.isabs(chosen)
+
+        wav_path = None
+        if is_bare and not chosen_explicit:
+            try:
+                wav_path = resolve_bare_name(chosen, search_dirs)
+            except (RuntimeError, FileNotFoundError) as e:
+                raise RuntimeError(
+                    f"{e} Scanned directories: {', '.join(search_dirs) or '(none)'}"
+                )
+        else:
+            try:
+                wav_path = resolve_input_path(chosen, search_dirs, folder_paths.models_dir)
+            except FileNotFoundError as e:
+                raise RuntimeError(
+                    f"{e}. Scanned directories: {', '.join(search_dirs) or '(none)'}"
+                )
 
         print(f"🎙️ [Qwen3-TTS] LoadSpeaker resolved: {wav_path}")
 

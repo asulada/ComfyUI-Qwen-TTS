@@ -13,6 +13,9 @@ from voice_store import (
     dir_label,
     list_voice_files,
     parse_env_dirs,
+    read_voice_metadata,
+    relative_voice_path,
+    resolve_bare_name,
     resolve_input_path,
     resolve_output_dir,
     sibling_metadata_paths,
@@ -134,8 +137,28 @@ class ListVoiceFilesTests(unittest.TestCase):
 
     def test_build_choices(self):
         entries = list_voice_files([self.a])
-        self.assertEqual(len(build_filename_choices(entries)), 2)
+        choices = build_filename_choices(entries)
+        self.assertEqual(choices, ["voices/a.WAV", "voices/z.wav"])
         self.assertEqual(build_filename_choices([], empty=True), ["None"])
+
+    def test_choices_never_contain_bare_names(self):
+        entries = list_voice_files([self.a, self.b])
+        choices = build_filename_choices(entries)
+        self.assertTrue(all("/" in c for c in choices))
+        self.assertNotIn("z.wav", choices)
+
+    def test_same_filename_in_two_dirs_stays_distinct(self):
+        dup_a = os.path.join(self.root, "libA")
+        dup_b = os.path.join(self.root, "libB")
+        os.makedirs(dup_a)
+        os.makedirs(dup_b)
+        open(os.path.join(dup_a, "same.wav"), "w").close()
+        open(os.path.join(dup_b, "same.wav"), "w").close()
+
+        choices = build_filename_choices(list_voice_files([dup_a, dup_b]))
+
+        self.assertEqual(len([c for c in choices if c.endswith("/same.wav")]), 2)
+        self.assertNotIn("same.wav", choices)
 
     def test_split_display_name(self):
         self.assertEqual(split_display_name("voices/a.wav"), ("voices", "a.wav"))
@@ -199,6 +222,91 @@ class ResolvePathTests(unittest.TestCase):
         paths = sibling_metadata_paths(os.path.join(self.custom, "villain.wav"))
         self.assertEqual(paths["qvp"], os.path.join(self.custom, "villain.qvp"))
         self.assertEqual(paths["json"], os.path.join(self.custom, "villain.json"))
+
+
+class BareNameResolutionTests(unittest.TestCase):
+    """A bare filename must never silently load a different speaker."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.default = os.path.join(self.root, "voices")
+        self.lib = os.path.join(self.root, "libB")
+        self.lib2 = os.path.join(self.root, "libC")
+        for d in (self.default, self.lib, self.lib2):
+            os.makedirs(d)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _touch(self, directory, name="hero.wav"):
+        path = os.path.join(directory, name)
+        open(path, "w").close()
+        return path
+
+    def test_default_directory_resolves(self):
+        self._touch(self.default)
+
+        resolved = resolve_bare_name("hero.wav", [self.default, self.lib])
+
+        self.assertEqual(resolved, os.path.abspath(os.path.join(self.default, "hero.wav")))
+
+    def test_other_directory_only_is_an_error(self):
+        self._touch(self.lib)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_bare_name("hero.wav", [self.default, self.lib])
+
+        self.assertIn("not in the default voice directory", str(ctx.exception))
+        self.assertIn("<label>/<file>", str(ctx.exception))
+
+    def test_multiple_other_matches_still_error(self):
+        self._touch(self.lib)
+        self._touch(self.lib2)
+
+        with self.assertRaises(RuntimeError):
+            resolve_bare_name("hero.wav", [self.default, self.lib, self.lib2])
+
+    def test_missing_raises_file_not_found(self):
+        with self.assertRaises(FileNotFoundError):
+            resolve_bare_name("hero.wav", [self.default, self.lib])
+
+
+class MetadataPathTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.lib = os.path.join(self.root, "libA")
+        os.makedirs(os.path.join(self.lib, "sub"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_relative_path_is_forward_slashed(self):
+        audio = os.path.join(self.lib, "sub", "hero.wav")
+        open(audio, "w").close()
+        self.assertEqual(relative_voice_path(audio, self.lib), "sub/hero.wav")
+
+    def test_relative_path_at_root(self):
+        audio = os.path.join(self.lib, "hero.wav")
+        open(audio, "w").close()
+        self.assertEqual(relative_voice_path(audio, self.lib), "hero.wav")
+
+    def test_read_voice_metadata_missing_returns_empty(self):
+        self.assertEqual(read_voice_metadata(os.path.join(self.lib, "nope.wav")), {})
+
+    def test_read_voice_metadata_reads_relative_path(self):
+        import json
+
+        audio = os.path.join(self.lib, "hero.wav")
+        open(audio, "w").close()
+        with open(os.path.join(self.lib, "hero.json"), "w", encoding="utf-8") as f:
+            json.dump({"relative_path": "hero.wav", "ref_text": "hi"}, f)
+
+        meta = read_voice_metadata(audio)
+
+        self.assertEqual(meta["relative_path"], "hero.wav")
+        self.assertEqual(meta["ref_text"], "hi")
 
 
 if __name__ == "__main__":

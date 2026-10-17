@@ -177,6 +177,34 @@ def resolve_output_dir(
     return target
 
 
+def relative_voice_path(audio_path: str, directory: str) -> str:
+    """Path of a voice file relative to the directory that owns it.
+
+    Used for the ``relative_path`` metadata field so a voice can be found
+    again even when two libraries contain the same filename.
+    """
+    try:
+        rel = os.path.relpath(os.path.abspath(audio_path), os.path.abspath(directory))
+    except ValueError:
+        return ""
+    return rel.replace("\\", "/")
+
+
+def read_voice_metadata(audio_path: str) -> Dict[str, str]:
+    """Read the sidecar JSON next to an audio file; empty dict when absent."""
+    import json
+
+    path = sibling_metadata_paths(audio_path)["json"]
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def resolve_input_path(
     display_or_path: str,
     directories: Iterable[str],
@@ -184,10 +212,12 @@ def resolve_input_path(
 ) -> str:
     """Resolve what the Load node was given to a concrete audio file.
 
-    Accepts, in order of precedence:
+    Accepts:
       1. an absolute path to a file
-      2. a bare filename found in one of the scanned directories
-      3. a ``"<label>/<filename>"`` display name
+      2. a ``"<label>/<filename>"`` display name (what the dropdown yields)
+
+    Bare filenames are handled by ``resolve_bare_name`` and must live in the
+    default directory, so no cross-library guessing happens here.
     """
     text = (display_or_path or "").strip().strip('"')
     if not text:
@@ -217,8 +247,76 @@ def resolve_input_path(
     raise FileNotFoundError(f"Voice file not found: {text}")
 
 
+def find_bare_matches(
+    bare_name: str,
+    directories: Iterable[str],
+) -> List[str]:
+    """Absolute paths of every scanned directory entry named ``bare_name``."""
+    wanted = (bare_name or "").strip().lower()
+    if not wanted:
+        return []
+
+    found: List[str] = []
+    seen = set()
+    for path in directories:
+        if not path or not os.path.isdir(path):
+            continue
+        try:
+            names = os.listdir(path)
+        except OSError:
+            continue
+        for name in names:
+            if name.lower() != wanted:
+                continue
+            full = os.path.join(path, name)
+            if not os.path.isfile(full):
+                continue
+            key = _norm(full)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(os.path.abspath(full))
+    return found
+
+
+def resolve_bare_name(
+    bare_name: str,
+    directories: Iterable[str],
+) -> str:
+    """Resolve a bare filename against the default voice directory only.
+
+    The dropdown always yields ``"<label>/<file>"``, so a bare name can only
+    come from a hand-edited workflow or an explicitly wrong value.  Rather
+    than guessing across libraries, it must exist in the first scanned
+    directory (the default ``voices/``); everything else is a hard error.
+    """
+    dirs = [d for d in directories if d and os.path.isdir(d)]
+    text = (bare_name or "").strip()
+    if not text:
+        raise ValueError("No voice file specified")
+
+    if dirs:
+        candidate = os.path.join(dirs[0], text)
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+
+    others = find_bare_matches(text, dirs[1:])
+    if others:
+        raise RuntimeError(
+            f"'{text}' is not in the default voice directory. It was found elsewhere: "
+            + ", ".join(others)
+            + ". Select the '<label>/<file>' entry instead."
+        )
+
+    raise FileNotFoundError(f"Voice file not found: {text}")
+
+
 def build_filename_choices(entries: Iterable[Tuple[str, str]], empty: bool = False) -> List[str]:
-    """Dropdown values; keeps a ``"None"`` entry when nothing was found."""
+    """Dropdown values: one ``"<label>/<file>"`` entry per voice.
+
+    No bare-filename aliases are added: every value carries its directory, so
+    two libraries holding the same filename stay unambiguous.
+    """
     names = [display for display, _ in entries]
     if not names:
         return ["None"] if empty else []

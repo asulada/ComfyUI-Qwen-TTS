@@ -269,7 +269,9 @@ ComfyUI/
 export QWEN_TTS_VOICE_DIRS="/data/voices-a:/data/voices-b"   # Windows 用 set 并以 ; 分隔
 ```
 
-保存时用 `output_dir` 指定目标目录（留空 = 默认目录，相对路径落在 `models/qwen-tts/` 下，绝对路径原样使用），`subfolder` 可再分一层子目录。加载时下拉框显示为 `<目录标签>/<文件名>`，同名文件不会互相覆盖；`file_path` 可直接填入绝对路径，无需等待下拉刷新。
+保存时用 `output_dir` 指定目标目录（留空 = 默认目录，相对路径落在 `models/qwen-tts/` 下，绝对路径原样使用），`subfolder` 可再分一层子目录。加载时下拉框只提供 `<目录标签>/<文件名>`，同名文件不会混淆；`file_path` 可直接填入绝对路径，无需等待下拉刷新。
+
+新增或删除音色后，下拉列表在**下次执行任务时**刷新（ComfyUI 每次提交都会重新调用 `INPUT_TYPES()`），不需要重启服务。但工作流里已经保存的旧值不会自动改写：若那个音色已被删除，任务会因 `Value not in list` 失败，重新选一个即可。
 
 ### `extra_model_paths.yaml` 示例
 
