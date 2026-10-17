@@ -14,12 +14,48 @@ from comfy import model_management
 from comfy.utils import ProgressBar
 
 from .pause_utils import extract_leading_pause
+from .voice_store import (
+    collect_voice_dirs,
+    list_voice_files,
+    build_filename_choices,
+    resolve_input_path,
+    resolve_output_dir,
+    sibling_metadata_paths,
+)
+from .emotion_utils import (
+    EMOTION_CHOICES,
+    build_segment_plans,
+    parse_rich_text,
+    time_stretch,
+)
 
 # Register "qwen-tts" model folder for extra_model_paths.yaml support
 try:
     folder_paths.add_model_folder_path("qwen-tts", os.path.join(folder_paths.models_dir, "qwen-tts"))
 except Exception:
     pass
+
+
+def get_registered_qwen_dirs() -> List[str]:
+    """All roots registered for the "qwen-tts" folder type.
+
+    Includes ``models/qwen-tts`` plus anything from ``extra_model_paths.yaml``.
+    Never raises: voice browsing must not break node loading.
+    """
+    try:
+        return list(folder_paths.get_folder_paths("qwen-tts") or [])
+    except Exception:
+        return []
+
+
+def get_voice_search_dirs(extra_dir: str = "") -> List[str]:
+    """Voice directories visible to SaveVoice / LoadSpeaker."""
+    dirs = collect_voice_dirs(folder_paths.models_dir, get_registered_qwen_dirs())
+    if extra_dir and extra_dir.strip():
+        target = resolve_output_dir(extra_dir, folder_paths.models_dir, create=False)
+        if os.path.isdir(target) and target not in dirs:
+            dirs.append(target)
+    return dirs
 
 # ===== XPU 稳定性补丁：修复 level_zero 设备丢失 =====
 import transformers.pytorch_utils
@@ -669,6 +705,7 @@ class VoiceDesignNode:
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05, "tooltip": "Penalty for repetition"}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
+                "speed": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05, "tooltip": "Speech rate, pitch-preserving. 1.0 = model native pace"}),
             }
         }
 
@@ -678,7 +715,7 @@ class VoiceDesignNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "VoiceDesign: Generate custom voices from descriptions."
 
-    def generate(self, text: str, instruct: str, model_choice: str, device: str, precision: str, language: str, seed: int = 0, max_new_tokens: int = 2048, top_p: float = 1.0, top_k: int = 50, temperature: float = 0.9, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False) -> Tuple[Dict[str, Any]]:
+    def generate(self, text: str, instruct: str, model_choice: str, device: str, precision: str, language: str, seed: int = 0, max_new_tokens: int = 2048, top_p: float = 1.0, top_k: int = 50, temperature: float = 0.9, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, speed: float = 1.0) -> Tuple[Dict[str, Any]]:
         if not text or not instruct:
             raise RuntimeError("Text and instruction description are required")
 
@@ -720,7 +757,7 @@ class VoiceDesignNode:
         pbar.update_absolute(3, 3, None)
 
         if isinstance(wavs, list) and len(wavs) > 0:
-            waveform = torch.from_numpy(wavs[0]).float()
+            waveform = torch.from_numpy(time_stretch(wavs[0], speed)).float()
             if waveform.ndim == 1:
                 waveform = waveform.unsqueeze(0).unsqueeze(0)
             elif waveform.ndim == 2:
@@ -765,6 +802,7 @@ class VoiceCloneNode:
                 "instruct": ("STRING", {"multiline": True, "default": "", "placeholder": "Optional style/emotion, e.g. 用愤怒的语气说"}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
+                "speed": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05, "tooltip": "Speech rate, pitch-preserving. 1.0 = model native pace"}),
                 "custom_model_path": ("STRING", {"default": "", "placeholder": "Absolute path to local fine-tuned model"}),
             }
         }
@@ -864,7 +902,8 @@ class VoiceCloneNode:
                  top_p: float = 1.0, top_k: int = 50, temperature: float = 0.9, repetition_penalty: float = 1.05,
                  x_vector_only: bool = False, attention: str = "auto",
                  instruct: str = "",
-                 unload_model_after_generate: bool = False, custom_model_path: str = "") -> Tuple[Dict[str, Any]]:
+                 unload_model_after_generate: bool = False, custom_model_path: str = "",
+                 speed: float = 1.0) -> Tuple[Dict[str, Any]]:
         if ref_audio is None and voice_clone_prompt is None:
             raise RuntimeError("Either reference audio or voice clone prompt is required")
 
@@ -928,7 +967,7 @@ class VoiceCloneNode:
         pbar.update_absolute(3, 3, None)
 
         if isinstance(wavs, list) and len(wavs) > 0:
-            waveform = torch.from_numpy(wavs[0]).float()
+            waveform = torch.from_numpy(time_stretch(wavs[0], speed)).float()
             if waveform.ndim == 1:
                 waveform = waveform.unsqueeze(0).unsqueeze(0)
             elif waveform.ndim == 2:
@@ -972,6 +1011,7 @@ class CustomVoiceNode:
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
                 "custom_model_path": ("STRING", {"default": "", "placeholder": "Absolute path to local fine-tuned model"}),
                 "custom_speaker_name": ("STRING", {"default": "", "placeholder": "Custom speaker name (for fine-tuned models)"}),
+                "speed": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05, "tooltip": "Speech rate, pitch-preserving. 1.0 = model native pace"}),
             }
         }
 
@@ -981,7 +1021,7 @@ class CustomVoiceNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "CustomVoice: Generate speech using preset speakers."
 
-    def generate(self, text: str, speaker: str, model_choice: str, device: str, precision: str, language: str, seed: int = 0, instruct: str = "", max_new_tokens: int = 2048, top_p: float = 1.0, top_k: int = 50, temperature: float = 0.9, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, custom_model_path: str = "", custom_speaker_name: str = "") -> Tuple[Dict[str, Any]]:
+    def generate(self, text: str, speaker: str, model_choice: str, device: str, precision: str, language: str, seed: int = 0, instruct: str = "", max_new_tokens: int = 2048, top_p: float = 1.0, top_k: int = 50, temperature: float = 0.9, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, custom_model_path: str = "", custom_speaker_name: str = "", speed: float = 1.0) -> Tuple[Dict[str, Any]]:
         # Prefer custom_speaker_name if provided
         target_speaker = speaker
         if custom_speaker_name and custom_speaker_name.strip():
@@ -1031,7 +1071,7 @@ class CustomVoiceNode:
         pbar.update_absolute(3, 3, None)
 
         if isinstance(wavs, list) and len(wavs) > 0:
-            waveform = torch.from_numpy(wavs[0]).float()
+            waveform = torch.from_numpy(time_stretch(wavs[0], speed)).float()
             if waveform.ndim == 1:
                 waveform = waveform.unsqueeze(0).unsqueeze(0)
             elif waveform.ndim == 2:
@@ -1045,6 +1085,222 @@ class CustomVoiceNode:
             return (audio_data,)
 
         raise RuntimeError("Invalid audio data generated")
+
+
+class EmotionalTTSNode:
+    """
+    EmotionalTTS Node: emotion presets, inline markup, pauses and rate control.
+
+    Qwen3-TTS has no native emotion/steer/rate arguments, so this node builds
+    them on top of the existing API:
+      * preset + steer_weight -> calibrated `instruct` text
+      * inline markup -> per-segment instructions in one batched call
+      * `[pause:...]` -> inserted silence (independent of speech rate)
+      * `[rate:...]` / `speed` -> pitch-preserving time stretch
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "text": ("STRING", {
+                    "multiline": True,
+                    "default": "[sad]他走了。[pause:800ms]再也不会回来了。",
+                    "placeholder": "Inline markup: [sad] [whisper] [emotion:tender] [pause:800ms] [rate:1.2]",
+                }),
+                "speaker": (["Aiden", "Dylan", "Eric", "Ono_anna", "Ryan", "Serena", "Sohee", "Uncle_fu", "Vivian"], {"default": "Ryan", "tooltip": "Ignored when voice_clone_prompt is connected"}),
+                "emotion": (EMOTION_CHOICES, {"default": "none", "tooltip": "Global preset; inline tags override it per segment"}),
+                "steer_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Emotion intensity. 1.0 = preset as written; >1 amplifies, <1 softens"}),
+                "speed": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05, "tooltip": "Global speech rate (pitch-preserving). Inline [rate:x] overrides per segment"}),
+                "model_choice": (["1.7B", "0.6B"], {"default": "1.7B", "tooltip": "Emotion uses instruct; the 0.6B CustomVoice model ignores instruct (the Base model used for cloning does not)"}),
+                "device": (["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}),
+                "precision": (["bf16", "fp32"], {"default": "bf16"}),
+                "language": (DEMO_LANGUAGES, {"default": "Auto"}),
+            },
+            "optional": {
+                "voice_clone_prompt": ("VOICE_CLONE_PROMPT", {"tooltip": "Reference timbre from VoiceClonePromptNode / LoadSpeakerNode. Switches to the Base model and overrides speaker."}),
+                "instruct": ("STRING", {"multiline": True, "default": "", "placeholder": "Extra style text appended to every segment's preset"}),
+                "linebreak_pause": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 5.0, "step": 0.1, "tooltip": "Silence for each newline in the script"}),
+                "scale_pauses_with_speed": ("BOOLEAN", {"default": False, "tooltip": "Also speed up/slow down inserted silences"}),
+                "batch_size": ("INT", {"default": 4, "min": 1, "max": 32, "step": 1, "tooltip": "Segments generated per model call"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
+                "top_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Nucleus sampling probability"}),
+                "top_k": ("INT", {"default": 50, "min": 0, "max": 100, "step": 1, "tooltip": "Top-k sampling parameter"}),
+                "temperature": ("FLOAT", {"default": 0.9, "min": 0.1, "max": 2.0, "step": 0.1, "tooltip": "Sampling temperature"}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05, "tooltip": "Penalty for repetition"}),
+                "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
+                "custom_model_path": ("STRING", {"default": "", "placeholder": "Absolute path to local fine-tuned model"}),
+                "custom_speaker_name": ("STRING", {"default": "", "placeholder": "Custom speaker name (for fine-tuned models)"}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "generate"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "EmotionalTTS: preset emotions, inline emotion switching, pauses and rate control."
+
+    @staticmethod
+    def _wav_to_tensor(wav: np.ndarray) -> torch.Tensor:
+        waveform = torch.from_numpy(np.asarray(wav, dtype=np.float32).copy()).float()
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0).unsqueeze(0)
+        elif waveform.ndim == 2:
+            waveform = waveform.unsqueeze(0)
+            if waveform.shape[1] > 1:
+                waveform = torch.mean(waveform, dim=1, keepdim=True)
+        return waveform
+
+    def generate(self, text: str, speaker: str, emotion: str, steer_weight: float, speed: float,
+                 model_choice: str, device: str, precision: str, language: str,
+                 instruct: str = "", linebreak_pause: float = 0.5, scale_pauses_with_speed: bool = False,
+                 batch_size: int = 4, seed: int = 0, max_new_tokens: int = 2048,
+                 top_p: float = 1.0, top_k: int = 50, temperature: float = 0.9,
+                 repetition_penalty: float = 1.05, attention: str = "auto",
+                 unload_model_after_generate: bool = False, custom_model_path: str = "",
+                 custom_speaker_name: str = "", voice_clone_prompt: Optional[Any] = None) -> Tuple[Dict[str, Any]]:
+        if not text or not text.strip():
+            raise RuntimeError("Text is required")
+
+        segments = parse_rich_text(text, linebreak_pause)
+        if not segments:
+            raise RuntimeError("No speakable text found after parsing markup")
+
+        plans = build_segment_plans(
+            segments,
+            global_emotion=emotion,
+            steer_weight=steer_weight,
+            extra_instruct=instruct,
+            global_rate=speed,
+            scale_pauses_with_speed=scale_pauses_with_speed,
+        )
+        if not plans:
+            raise RuntimeError("No speakable text found after parsing markup")
+
+        if model_choice == "0.6B" and voice_clone_prompt is None and any(plan.instruct.strip() for plan in plans):
+            raise RuntimeError(
+                "EmotionalTTS needs instruct conditioning to apply emotions, but the 0.6B "
+                "CustomVoice model ignores instruct. Use model_choice='1.7B', or clear the "
+                "emotion preset / extra instruct to run 0.6B without emotion control."
+            )
+
+        use_clone = voice_clone_prompt is not None
+        if use_clone and model_choice == "0.6B" and any(plan.instruct.strip() for plan in plans):
+            print("⚠️ [Qwen3-TTS] EmotionalTTS: 0.6B Base model + emotion instruct is not officially "
+                  "documented; 1.7B follows the instruction more reliably.")
+
+        clone_item = None
+        if use_clone:
+            if isinstance(voice_clone_prompt, list):
+                if not voice_clone_prompt:
+                    raise RuntimeError("voice_clone_prompt is an empty list")
+                if len(voice_clone_prompt) > 1:
+                    print(f"⚠️ [Qwen3-TTS] EmotionalTTS uses a single timbre; "
+                          f"taking the first of {len(voice_clone_prompt)} prompts.")
+                clone_item = voice_clone_prompt[0]
+            else:
+                clone_item = voice_clone_prompt
+
+        def clone_arg(count: int):
+            # generate_voice_clone accepts either a single packaged dict or a
+            # list of VoiceClonePromptItem, so keep the dict shape as-is.
+            if isinstance(clone_item, dict):
+                return clone_item
+            return [clone_item] * count
+
+        model_type = "Base" if use_clone else "CustomVoice"
+
+        global _MODEL_CACHE
+        previous_attention = None
+        for key in _MODEL_CACHE:
+            if key[0] == model_type:
+                previous_attention = key[4] if len(key) > 4 else None
+                break
+
+        target_speaker = custom_speaker_name.strip() if custom_speaker_name and custom_speaker_name.strip() else speaker.lower().replace(" ", "_")
+
+        total_stages = (len(plans) + batch_size - 1) // batch_size + 1
+        pbar = ProgressBar(total_stages)
+        pbar.update_absolute(1, total_stages, None)
+
+        model = load_qwen_model(model_type, model_choice, device, precision, attention,
+                                unload_model_after_generate, previous_attention, custom_model_path)
+
+        torch.manual_seed(seed)
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            torch.xpu.manual_seed_all(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        np.random.seed(seed % (2**32))
+
+        mapped_lang = LANGUAGE_MAP.get(language, "auto")
+
+        results: List[torch.Tensor] = []
+        sr = 24000
+        stage = 1
+
+        for i in range(0, len(plans), batch_size):
+            chunk = plans[i:i + batch_size]
+
+            print(f"[Qwen3-TTS] EmotionalTTS segment chunk {i // batch_size + 1}/{(len(plans) + batch_size - 1) // batch_size}")
+
+            if use_clone:
+                wavs, sr = model.generate_voice_clone(
+                    text=[plan.text for plan in chunk],
+                    language=[mapped_lang] * len(chunk),
+                    voice_clone_prompt=clone_arg(len(chunk)),
+                    instruct=[plan.instruct for plan in chunk],
+                    max_new_tokens=max_new_tokens,
+                    top_p=top_p,
+                    top_k=top_k,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                )
+            else:
+                wavs, sr = model.generate_custom_voice(
+                    text=[plan.text for plan in chunk],
+                    language=[mapped_lang] * len(chunk),
+                    speaker=[target_speaker] * len(chunk),
+                    instruct=[plan.instruct for plan in chunk],
+                    max_new_tokens=max_new_tokens,
+                    top_p=top_p,
+                    top_k=top_k,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                )
+
+            if len(wavs) != len(chunk):
+                raise RuntimeError(f"Model returned {len(wavs)} waveforms for {len(chunk)} segments")
+
+            for plan, wav in zip(chunk, wavs):
+                stretched = time_stretch(wav, plan.rate)
+
+                if plan.leading_pause > 0:
+                    results.append(torch.zeros((1, 1, int(plan.leading_pause * sr)), dtype=torch.float32))
+                results.append(self._wav_to_tensor(stretched))
+                if plan.pause_after > 0:
+                    results.append(torch.zeros((1, 1, int(plan.pause_after * sr)), dtype=torch.float32))
+
+            if hasattr(torch, 'xpu') and torch.xpu.is_available():
+                torch.xpu.empty_cache()
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            stage += 1
+            pbar.update_absolute(stage, total_stages, None)
+
+        if not results:
+            raise RuntimeError("No audio was generated")
+
+        merged = torch.cat(results, dim=-1)
+        audio_data = {"waveform": merged, "sample_rate": sr}
+
+        if unload_model_after_generate and hasattr(model, '_unload_callback') and model._unload_callback:
+            model._unload_callback()
+
+        return (audio_data,)
 
 
 class VoiceClonePromptNode:
@@ -1181,6 +1437,8 @@ class DialogueInferenceNode:
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05, "tooltip": "Penalty for repetition"}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
+                "instruct": ("STRING", {"multiline": True, "default": "", "placeholder": "Style applied to every line, e.g. 低声耳语，语速缓慢"}),
+                "speed": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05, "tooltip": "Speech rate, pitch-preserving. Configured pauses are not scaled"}),
             }
         }
 
@@ -1190,7 +1448,7 @@ class DialogueInferenceNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "DialogueInference: Execute a script with multiple roles and generate continuous speech."
     # ### UPDATED ARGUMENTS: Added question_pause, hyphen_pause
-    def generate_dialogue(self, script: str, role_bank: Dict[str, Any], model_choice: str, device: str, precision: str, language: str, pause_linebreak: float, period_pause: float, comma_pause: float, question_pause: float, hyphen_pause: float, merge_outputs: bool, batch_size: int, seed: int = 0, max_new_tokens_per_line: int = 2048, top_p: float = 1.0, top_k: int = 50, temperature: float = 0.9, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False) -> Tuple[Dict[str, Any]]:
+    def generate_dialogue(self, script: str, role_bank: Dict[str, Any], model_choice: str, device: str, precision: str, language: str, pause_linebreak: float, period_pause: float, comma_pause: float, question_pause: float, hyphen_pause: float, merge_outputs: bool, batch_size: int, seed: int = 0, max_new_tokens_per_line: int = 2048, top_p: float = 1.0, top_k: int = 50, temperature: float = 0.9, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, instruct: str = "", speed: float = 1.0) -> Tuple[Dict[str, Any]]:
         if not script or not role_bank:
             raise RuntimeError("Script and Role Bank are required")
 
@@ -1317,6 +1575,7 @@ class DialogueInferenceNode:
                     text=chunk_texts,
                     language=chunk_langs,
                     voice_clone_prompt=chunk_prompts,
+                    instruct=instruct if instruct and instruct.strip() else None,
                     max_new_tokens=max_new_tokens_per_line,
                     top_p=top_p,
                     top_k=top_k,
@@ -1325,7 +1584,7 @@ class DialogueInferenceNode:
                 )
 
                 for j, wav in enumerate(wavs_list):
-                    waveform = torch.from_numpy(wav).float()
+                    waveform = torch.from_numpy(time_stretch(wav, speed)).float()
                     if waveform.ndim == 1:
                         waveform = waveform.unsqueeze(0).unsqueeze(0)
                     elif waveform.ndim == 2:
@@ -1400,11 +1659,22 @@ class SaveVoiceNode:
         return {
             "required": {
                 "voice_clone_prompt": ("VOICE_CLONE_PROMPT",),
-                "filename": ("STRING", {"default": "my_custom_voice"}),
+                "filename": ("STRING", {"default": "my_custom_voice", "tooltip": "File stem (no extension, no directory)"}),
             },
             "optional": {
                 "audio": ("AUDIO",),
                 "ref_text": ("STRING", {"multiline": True, "default": "", "placeholder": "Reference audio text (optional, but recommended for better quality)"}),
+                "output_dir": ("STRING", {
+                    "default": "",
+                    "placeholder": "Empty = models/qwen-tts/voices; relative = under models/qwen-tts; absolute = as-is",
+                    "tooltip": "Base directory to save the voice into. Created when missing.",
+                }),
+                "subfolder": ("STRING", {
+                    "default": "",
+                    "placeholder": "Optional sub-directory inside output_dir, e.g. audiobook/ch1",
+                    "tooltip": "Keeps libraries organised without changing output_dir",
+                }),
+                "overwrite": ("BOOLEAN", {"default": True, "tooltip": "Overwrite an existing voice with the same name"}),
             }
         }
 
@@ -1414,24 +1684,46 @@ class SaveVoiceNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "SaveVoice: Save voice clone prompt features to disk for later use."
 
-    def save(self, voice_clone_prompt, filename, audio=None, ref_text=""):
+    def save(self, voice_clone_prompt, filename, audio=None, ref_text="", output_dir="", subfolder="", overwrite=True):
         import soundfile as sf
         import json
-        if not filename.endswith(".qvp"):
-            filename_qvp = filename + ".qvp"
-            filename_wav = filename + ".wav"
-            filename_json = filename + ".json"
-        else:
-            filename_qvp = filename
-            filename_wav = filename.replace(".qvp", ".wav")
-            filename_json = filename.replace(".qvp", ".json")
-        
-        # Use ComfyUI models/qwen-tts/voices directory
-        output_dir = os.path.join(folder_paths.models_dir, "qwen-tts", "voices")
-        os.makedirs(output_dir, exist_ok=True)
-        
+
+        stem = (filename or "").strip().strip('"')
+        if not stem:
+            raise RuntimeError("Filename is required")
+
+        for ext in (".qvp", ".wav", ".json"):
+            if stem.lower().endswith(ext):
+                stem = stem[: -len(ext)]
+                break
+
+        # A filename is a name, not a path: reject separators and escapes.
+        if os.path.basename(stem) != stem or stem in (".", ".."):
+            raise RuntimeError(f"Invalid filename: {filename!r} (use 'subfolder' for directories)")
+
+        # Resolve the target directory (default / relative / absolute).
+        target_root = resolve_output_dir(output_dir, folder_paths.models_dir, create=True)
+
+        sub_parts = [p for p in (subfolder or "").replace("\\", "/").split("/") if p not in ("", ".")]
+        if any(p == ".." for p in sub_parts):
+            raise RuntimeError(f"Invalid subfolder: {subfolder!r}")
+
+        target_dir = os.path.join(target_root, *sub_parts) if sub_parts else target_root
+        os.makedirs(target_dir, exist_ok=True)
+
+        path_qvp = os.path.join(target_dir, stem + ".qvp")
+        path_json = os.path.join(target_dir, stem + ".json")
+        path_wav = os.path.join(target_dir, stem + ".wav")
+
+        if not overwrite:
+            existing = [p for p in (path_qvp, path_json, path_wav) if os.path.exists(p)]
+            if existing:
+                raise RuntimeError(
+                    f"Voice already exists at {os.path.dirname(path_qvp)}: {os.path.basename(existing[0])}. "
+                    "Enable 'overwrite' or choose another name."
+                )
+
         # 1. Save features (Raw prompt)
-        path_qvp = os.path.join(output_dir, filename_qvp)
         torch.save(voice_clone_prompt, path_qvp)
         print(f"✅ [Qwen3-TTS] Voice features saved to: {path_qvp}")
 
@@ -1439,9 +1731,9 @@ class SaveVoiceNode:
         metadata = {
             "ref_text": ref_text.strip() if ref_text else "",
             "source": "SaveVoiceNode",
-            "version": "1.0"
+            "version": "1.0",
+            "saved_path": path_wav,
         }
-        path_json = os.path.join(output_dir, filename_json)
         try:
             with open(path_json, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=4)
@@ -1465,12 +1757,12 @@ class SaveVoiceNode:
                 if waveform_np.ndim == 3: # [B, C, S] -> [S, C] (assume batch size 1)
                     waveform_np = waveform_np[0].T
                 
-                wav_path = os.path.join(output_dir, filename_wav)
-                sf.write(wav_path, waveform_np, sr)
-                print(f"✅ [Qwen3-TTS] Reference audio (Speaker) saved to: {wav_path}")
+                sf.write(path_wav, waveform_np, sr)
+                print(f"✅ [Qwen3-TTS] Reference audio (Speaker) saved to: {path_wav}")
             except Exception as e:
                 print(f"⚠️ [Qwen3-TTS] Failed to save reference audio: {e}")
 
+        print(f"💾 [Qwen3-TTS] Voice saved: {path_wav}")
         return {}
 
 
@@ -1478,17 +1770,36 @@ class LoadSpeakerNode:
     """
     LoadSpeaker Node: Directly load a WAV/Speaker file and its associated features.
     Part of the "Voice Design then Clone" best practice workflow.
+
+    Scans every registered qwen-tts root (plus optional extra directories) and
+    lists voices as "<label>/<file>", so two libraries with the same filename
+    stay distinguishable.
     """
     @classmethod
     def INPUT_TYPES(cls):
-        output_dir = os.path.join(folder_paths.models_dir, "qwen-tts", "voices")
-        os.makedirs(output_dir, exist_ok=True)
-        # List WAV files in the voices directory
-        files = [f for f in os.listdir(output_dir) if f.endswith((".wav", ".mp3", ".flac"))]
-        
+        try:
+            dirs = get_voice_search_dirs()
+            entries = list_voice_files(dirs)
+            files = build_filename_choices(entries, empty=True)
+        except Exception as e:  # browsing must never break node registration
+            print(f"⚠️ [Qwen3-TTS] LoadSpeaker: failed to scan voice directories: {e}")
+            files = ["None"]
+
         return {
             "required": {
-                "filename": (files if files else ["None"],),
+                "filename": (files, {"tooltip": "Voices found in all scanned directories, shown as <label>/<file>"}),
+            },
+            "optional": {
+                "directory": ("STRING", {
+                    "default": "",
+                    "placeholder": "Extra directory to scan (absolute, or relative to models/qwen-tts)",
+                    "tooltip": "Added to the dropdown on the next workflow reload; also used to resolve relative paths",
+                }),
+                "file_path": ("STRING", {
+                    "default": "",
+                    "placeholder": "Optional: absolute path or <label>/<file>; overrides the dropdown",
+                    "tooltip": "Use this to load a voice that is not in the dropdown yet, without reloading",
+                }),
             },
         }
     
@@ -1499,13 +1810,24 @@ class LoadSpeakerNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "LoadSpeaker: Load saved WAV audio and its metadata. Fast-loads .qvp features if available."
 
-    def load_speaker(self, filename):
-        if filename == "None":
-            raise RuntimeError("No speaker files found to load.")
-            
-        voices_dir = os.path.join(folder_paths.models_dir, "qwen-tts", "voices")
-        wav_path = os.path.join(voices_dir, filename)
-        
+    def load_speaker(self, filename, directory="", file_path=""):
+        chosen = (file_path or "").strip() or (filename or "").strip()
+        if not chosen or chosen == "None":
+            raise RuntimeError(
+                "No speaker files found to load. Save one with SaveVoice, or point 'file_path' "
+                "at an existing .wav/.qvp pair."
+            )
+
+        search_dirs = get_voice_search_dirs(directory)
+        try:
+            wav_path = resolve_input_path(chosen, search_dirs, folder_paths.models_dir)
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"{e}. Scanned directories: {', '.join(search_dirs) or '(none)'}"
+            )
+
+        print(f"🎙️ [Qwen3-TTS] LoadSpeaker resolved: {wav_path}")
+
         # 1. Load the AUDIO for output/preview
         import librosa
         wav, sr = librosa.load(wav_path, sr=None)
@@ -1513,10 +1835,9 @@ class LoadSpeakerNode:
         audio_preview = {"waveform": waveform, "sample_rate": sr}
 
         # 2. Automatically load metadata and pre-computed features
-        qvp_file = os.path.splitext(filename)[0] + ".qvp"
-        qvp_path = os.path.join(voices_dir, qvp_file)
-        json_file = os.path.splitext(filename)[0] + ".json"
-        json_path = os.path.join(voices_dir, json_file)
+        meta_paths = sibling_metadata_paths(wav_path)
+        qvp_path = meta_paths["qvp"]
+        json_path = meta_paths["json"]
         
         prompt_items = None
         ref_text = ""
@@ -1530,7 +1851,7 @@ class LoadSpeakerNode:
                     if not ref_text or not ref_text.strip():
                         ref_text = metadata.get("ref_text", "")
                         if ref_text:
-                            print(f"📖 [Qwen3-TTS] Loaded metadata from JSON: {json_file}")
+                            print(f"📖 [Qwen3-TTS] Loaded metadata from JSON: {os.path.basename(json_path)}")
             except Exception as e:
                 print(f"⚠️ [Qwen3-TTS] Failed to load metadata JSON: {e}")
 
@@ -1553,7 +1874,7 @@ class LoadSpeakerNode:
                     # Raw prompt data
                     prompt_items = data
                 
-                print(f"🚀 [Qwen3-TTS] Fast-loaded pre-computed features from: {qvp_file}")
+                print(f"🚀 [Qwen3-TTS] Fast-loaded pre-computed features from: {os.path.basename(qvp_path)}")
             except Exception as e:
                 print(f"⚠️ [Qwen3-TTS] Failed to fast-load .qvp: {e}")
 
