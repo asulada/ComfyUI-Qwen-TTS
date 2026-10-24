@@ -261,6 +261,82 @@ def check_cuda_runtime(device):
             raise
 
 
+def warn_on_missing_instruct(instruct: str, has_clone_prompt: bool, node_name: str) -> None:
+    """Warn when a clone is driven by voice_clone_prompt but no style text.
+
+    ``spk_emb`` anchors *who* is speaking, but nothing constrains pitch, rate or
+    perceived age.  Measured on a cloned female voice, dropping ``instruct``
+    moved the median pitch by -10.5 semitones and the spectral centroid by
+    -38%; a one-line instruction about age/pitch recovered ~9 semitones.  The
+    failure is silent, so it goes unnoticed until a line sounds like someone
+    else.  See docs/DECISIONS.md (2026-10-24).
+    """
+    if not has_clone_prompt:
+        return
+    if instruct and instruct.strip():
+        return
+    print(
+        f"⚠️ [Qwen3-TTS] {node_name}: 'instruct' is empty while 'voice_clone_prompt' "
+        "is connected. The clone keeps the timbre but not the pitch range or "
+        "perceived age, which can drift by an octave on emphatic lines. "
+        "Describe voice + pitch + rate here (e.g. '中高音区，音色清亮，语速中等') "
+        "to keep every line on the same character."
+    )
+
+
+def warn_on_missing_role(role_name: str, role_bank: Dict[str, Any], line_no: int) -> None:
+    """Warn when a script line names a role that the bank does not contain.
+
+    The dialogue node silently skips such lines, so a typo in a character name
+    makes a whole spoken line disappear without any error.
+    """
+    if role_name in role_bank:
+        return
+    known = ", ".join(sorted(role_bank)) or "(角色银行为空)"
+    print(
+        f"⚠️ [Qwen3-TTS] DialogueInference: line {line_no} uses role '{role_name}', "
+        f"which is not in the role bank, so the line was skipped. Known roles: {known}"
+    )
+
+
+def expand_dialogue_line(
+    text: str,
+    pause_config: Dict[str, float],
+    extra_instruct: str = "",
+) -> List[Tuple[str, str, float, float, List[str]]]:
+    """Turn one dialogue line into generation units.
+
+    Returns ``(speech_text, instruct, leading_pause, pause_after, dropped)`` per
+    unit.  Two splitting passes run in order:
+
+    1. ``split_text_by_pauses`` splits on punctuation so each fragment can carry
+       its own pause (an existing behaviour that keeps prosody natural);
+    2. ``parse_rich_text`` resolves inline markup inside each fragment, so
+       ``[sad]``/``[style:...]`` can change the delivery mid-line while the
+       speaker — and therefore the cloned timbre — stays the same.
+
+    Trailing flat punctuation is stripped to avoid robotic intonation drops on
+    short pieces; ``?`` and ``!`` are kept because they carry the contour.
+
+    Kept free of ComfyUI/torch so it can be unit-tested directly.
+    """
+    units: List[Tuple[str, str, float, float, List[str]]] = []
+    for segment_text, segment_pause in split_text_by_pauses(text, pause_config):
+        if not re.sub(r"[^\w\u4e00-\u9fa5]", "", segment_text).strip():
+            continue
+        for plan in build_segment_plans(parse_rich_text(segment_text),
+                                        extra_instruct=extra_instruct):
+            piece = re.sub(r"[\.,，。…\-—]+$", "", plan.text).strip() or plan.text
+            units.append((
+                piece,
+                plan.instruct,
+                plan.leading_pause,
+                segment_pause + plan.pause_after,
+                list(plan.dropped_tags),
+            ))
+    return units
+
+
 def split_text_by_pauses(text: str, config: Dict[str, float]) -> List[Tuple[str, float]]:
     """
     Split text into segments based on punctuation and defined pause durations.
@@ -909,6 +985,8 @@ class VoiceCloneNode:
         if ref_audio is None and voice_clone_prompt is None:
             raise RuntimeError("Either reference audio or voice clone prompt is required")
 
+        warn_on_missing_instruct(instruct, voice_clone_prompt is not None, "VoiceClone")
+
         pbar = ProgressBar(3)
 
         global _MODEL_CACHE
@@ -1180,6 +1258,9 @@ class EmotionalTTSNode:
         )
         if not plans:
             raise RuntimeError("No speakable text found after parsing markup")
+
+        if not any(plan.instruct.strip() for plan in plans):
+            warn_on_missing_instruct("", voice_clone_prompt is not None, "EmotionalTTS")
 
         if model_choice == "0.6B" and voice_clone_prompt is None and any(plan.instruct.strip() for plan in plans):
             raise RuntimeError(
@@ -1454,6 +1535,8 @@ class DialogueInferenceNode:
         if not script or not role_bank:
             raise RuntimeError("Script and Role Bank are required")
 
+        warn_on_missing_instruct(instruct, True, "DialogueInference")
+
         pbar = ProgressBar(3)
 
         global _MODEL_CACHE
@@ -1481,6 +1564,7 @@ class DialogueInferenceNode:
         langs_to_gen = []
         leading_pauses_to_gen = []
         pauses_to_gen = []
+        instructs_to_gen = []
 
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
 
@@ -1506,6 +1590,7 @@ class DialogueInferenceNode:
             text = text.strip()
 
             if role_name not in role_bank:
+                warn_on_missing_role(role_name, role_bank, idx + 1)
                 continue
 
             text, leading_pause = extract_leading_pause(text)
@@ -1524,26 +1609,23 @@ class DialogueInferenceNode:
                 "hyphen_pause": hyphen_pause
             }
             
-            segments = split_text_by_pauses(text, config)
+            units = expand_dialogue_line(text, config, extra_instruct=instruct)
 
             first_generated_segment = True
-
-            for segment_text, current_segment_pause in segments:
-                pronounceable = re.sub(r'[^\w\u4e00-\u9fa5]', '', segment_text)
-                if not pronounceable.strip():
-                    continue
-
-                # Strip trailing flat punctuation to prevent robotic intonation dropping on short segments
-                # We keep ? and ! because they convey necessary emotive intonation.
-                clean_seg_text = re.sub(r'[\.,，。…\-—]+$', '', segment_text).strip()
-                if not clean_seg_text:
-                    clean_seg_text = segment_text
-
-                texts_to_gen.append(clean_seg_text)
+            for piece, piece_instruct, piece_lead, piece_pause, dropped in units:
+                texts_to_gen.append(piece)
                 prompts_to_gen.append(current_prompt)
                 langs_to_gen.append(mapped_lang)
-                leading_pauses_to_gen.append(leading_pause if first_generated_segment else 0.0)
-                pauses_to_gen.append(current_segment_pause)
+                instructs_to_gen.append(piece_instruct)
+                leading_pauses_to_gen.append(
+                    leading_pause + piece_lead if first_generated_segment else piece_lead
+                )
+                pauses_to_gen.append(piece_pause)
+                for tag in dropped:
+                    print(
+                        f"⚠️ [Qwen3-TTS] DialogueInference: dropped unknown tag "
+                        f"{tag} on line {idx + 1}; use [style:...] for free-form text."
+                    )
                 first_generated_segment = False
 
             if pauses_to_gen:
@@ -1569,6 +1651,7 @@ class DialogueInferenceNode:
                 chunk_langs = langs_to_gen[i:i + batch_size]
                 chunk_leading_pauses = leading_pauses_to_gen[i:i + batch_size]
                 chunk_pauses = pauses_to_gen[i:i + batch_size]
+                chunk_instructs = instructs_to_gen[i:i + batch_size]
 
                 current_chunk = i // batch_size + 1
                 print(f"[Qwen3-TTS] Running batched inference for chunk {current_chunk} of {num_chunks}...")
@@ -1577,7 +1660,7 @@ class DialogueInferenceNode:
                     text=chunk_texts,
                     language=chunk_langs,
                     voice_clone_prompt=chunk_prompts,
-                    instruct=instruct if instruct and instruct.strip() else None,
+                    instruct=[text or None for text in chunk_instructs],
                     max_new_tokens=max_new_tokens_per_line,
                     top_p=top_p,
                     top_k=top_k,
@@ -1772,9 +1855,11 @@ class SaveVoiceNode:
                 print(f"⚠️ [Qwen3-TTS] Failed to save reference audio: {e}")
         else:
             print(
-                "⚠️ [Qwen3-TTS] No 'audio' input connected: saved .qvp/.json only. "
-                "LoadSpeaker needs the .wav, so connect an AUDIO output (e.g. from the "
-                "VoiceClone/VoiceDesign node) to SaveVoice's 'audio' input."
+                "⚠️ [Qwen3-TTS] SaveVoice: no 'audio' input connected — this voice will "
+                "NOT appear in LoadSpeaker's dropdown and cannot be re-cloned. Only "
+                f"{os.path.basename(path_qvp)} and its .json were written; LoadSpeaker "
+                "resolves voices from their .wav. Connect an AUDIO output (from "
+                "VoiceClone / VoiceDesign) to SaveVoice's 'audio' input and save again."
             )
 
         if wav_written:

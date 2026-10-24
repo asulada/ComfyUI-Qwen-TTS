@@ -15,7 +15,7 @@ Nothing here imports torch, so the parsing helpers stay unit-testable.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -99,6 +99,39 @@ EMOTION_ALIASES.update(
 EMOTION_CHOICES: List[str] = ["none"] + [k for k in EMOTION_PRESETS if k != "none"]
 
 
+def _validate_alias_table() -> None:
+    """Fail fast when the alias table would silently mis-route a tag.
+
+    Python already collapses duplicate dict keys, so the real risk is an alias
+    whose *value* is not a preset -- a typo there makes the tag resolve to a key
+    that ``EMOTION_PRESETS`` does not contain, and the tag quietly stops
+    working.  Alias keys must also not collide with a preset name, otherwise a
+    canonical tag could be shadowed.
+    """
+    missing = {
+        alias: target for alias, target in EMOTION_ALIASES.items()
+        if target not in EMOTION_PRESETS
+    }
+    if missing:
+        raise RuntimeError(
+            "EMOTION_ALIASES points at unknown presets: "
+            + ", ".join(f"{a!r}->{t!r}" for a, t in sorted(missing.items()))
+        )
+
+    shadowed = set(EMOTION_ALIASES) & set(EMOTION_PRESETS)
+    wrong = {alias for alias in shadowed if EMOTION_ALIASES[alias] != alias}
+    if wrong:
+        raise RuntimeError(
+            "EMOTION_ALIASES redefines preset names: " + ", ".join(sorted(wrong))
+        )
+
+    if len(EMOTION_CHOICES) != len(set(EMOTION_CHOICES)):
+        raise RuntimeError("EMOTION_CHOICES contains duplicates")
+
+
+_validate_alias_table()
+
+
 def normalize_emotion(name: Optional[str]) -> Optional[str]:
     """Resolve a preset name / alias to a canonical preset key.
 
@@ -140,24 +173,29 @@ def build_emotion_instruct(
     preset: str = "none",
     steer_weight: float = 1.0,
     extra_instruct: str = "",
+    style: str = "",
 ) -> str:
     """Compose the ``instruct`` string for one segment.
 
     ``preset`` is a canonical key or any alias; unknown values are treated as
-    "none".  ``extra_instruct`` is appended after the preset so user text wins
-    on the details it mentions.
+    "none".  ``extra_instruct`` (the node-level field) is appended after the
+    preset so user text wins on the details it mentions.  ``style`` carries
+    text from inline ``[style:...]`` tags and sits closest to the preset,
+    because it describes this segment specifically.
     """
     key = normalize_emotion(preset) or "none"
     base = EMOTION_PRESETS.get(key, "").strip()
     extra = (extra_instruct or "").strip()
+    inline = (style or "").strip()
 
-    if not base:
-        return extra
-
-    text = f"{_steer_clause(steer_weight)}{base}"
+    parts: List[str] = []
+    if base:
+        parts.append(f"{_steer_clause(steer_weight)}{base}")
+    if inline:
+        parts.append(inline)
     if extra:
-        text = f"{text}，{extra}"
-    return text
+        parts.append(extra)
+    return "，".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -174,20 +212,45 @@ class RichSegment:
     rate: Optional[float] = None
     pause_after: float = 0.0
     leading_pause: float = 0.0
+    style: str = ""
+    # Tags that were dropped because nothing recognised them.  Callers surface
+    # these to the user; keeping them on the segment avoids a global log sink.
+    dropped_tags: List[str] = field(default_factory=list)
 
 
-# [sad] | [emotion:sad] | [pause:800ms] | [break=0.5] | [rate:1.2]
+# Recognised markup.  Every branch is an explicit syntax; the bare branch is the
+# only one that guesses, and its guess is validated against EMOTION_ALIASES.
+#   [sad] [低语]              emotion shorthand
+#   [emotion:tender]          explicit emotion
+#   [style:冷笑着压低声音]     free-form instruction, appended to this segment
+#   [pause:800ms] [pause:1.2s] [pause:0.5]   silence
+#   [rate:1.2] [speed:0.9]    speech rate
 _TAG_RE = re.compile(
     r"\[\s*(?:"
     r"(?:(?:emotion|emo)\s*[:=]\s*(?P<emotion>[^\[\]]+?))"
-    r"|(?:(?P<pause_kw>pause|break)\s*[:=]\s*(?P<pause_num>[0-9]*\.?[0-9]+)\s*(?P<pause_unit>ms|s)?)"
+    r"|(?:(?P<pause_kw>pause)\s*[:=]\s*(?P<pause_num>[0-9]*\.?[0-9]+)\s*(?P<pause_unit>ms|s)?)"
     r"|(?:(?:rate|speed)\s*[:=]\s*(?P<rate>[0-9]*\.?[0-9]+))"
-    r"|(?P<bare>[A-Za-z_\u4e00-\u9fa5][A-Za-z0-9_\u4e00-\u9fa5]*)"
+    r"|(?:(?:style|instruct)\s*[:=]\s*(?P<style>[^\[\]]+?))"
+    r"|(?P<deprecated_break>break\s*[:=]\s*[0-9]*\.?[0-9]+\s*(?:ms|s)?)"
+    r"|(?P<bare>[A-Za-z_\u4e00-\u9fa5][A-Za-z0-9_\u4e00-\u9fa5]{0,39}(?: [A-Za-z0-9_\u4e00-\u9fa5]{1,40}){0,3})"
     r")\s*\]",
     re.IGNORECASE,
 )
 
+# Kept for a migration hint only: [break=x] syntax is removed, not parsed.
+_DEPRECATED_BREAK_RE = re.compile(r"\[\s*break\s*[:=]\s*[0-9]*\.?[0-9]+\s*(?:ms|s)?\s*\]", re.IGNORECASE)
+
 _MAX_PAUSE_SECONDS = 60.0
+
+
+def _join_style(existing: str, extra: str) -> str:
+    """Append free-form style text, avoiding duplicate separators."""
+    extra = (extra or "").strip()
+    if not extra:
+        return existing
+    if not existing:
+        return extra
+    return f"{existing}，{extra}"
 
 
 def _pause_seconds(raw: str, unit: Optional[str]) -> float:
@@ -212,15 +275,29 @@ def _expand_linebreaks(text: str, linebreak_pause: float) -> str:
     return re.sub(r"\n+", " ", text)
 
 
-def parse_rich_text(text: str, linebreak_pause: float = 0.0) -> List[RichSegment]:
+def parse_rich_text(
+    text: str,
+    linebreak_pause: float = 0.0,
+    preserve_unknown_tags: bool = False,
+) -> List[RichSegment]:
     """Split text into segments at markup tags.
 
-    Emotion and rate tags are *sticky*: they keep applying to later text until
-    changed, so a single ``[sad]`` can cover a whole paragraph.  Pause tags
+    Emotion, style and rate tags are *sticky*: they keep applying to later text
+    until changed, so a single ``[sad]`` can cover a whole paragraph.  Pause tags
     close the current segment and become silence after it; a pause with no text
     before it becomes ``leading_pause`` of the next segment.
 
-    Unknown bracket tags (e.g. ``[laugh]``) are preserved verbatim as text.
+    Tags fall into three groups:
+
+    * **recognised** -- emotion shorthands (``[sad]``, ``[低语]``),
+      ``[emotion:...]``, ``[style:...]``, ``[pause:...]``, ``[rate:...]``;
+    * **unknown** -- dropped by default, because the model would otherwise speak
+      the brackets aloud.  The dropped text is recorded on the segment and the
+      caller can surface it.  ``preserve_unknown_tags=True`` restores the old
+      behaviour of keeping them as literal text;
+    * **deprecated** -- ``[break=0.5]`` is gone; it is dropped with a hint even
+      when ``preserve_unknown_tags`` is set, since keeping it only leads to it
+      being read out.
     """
     if not text or not text.strip():
         return []
@@ -231,10 +308,12 @@ def parse_rich_text(text: str, linebreak_pause: float = 0.0) -> List[RichSegment
     buf: List[str] = []
     state_emotion: Optional[str] = None
     state_rate: Optional[float] = None
+    state_style: str = ""
+    dropped: List[str] = []
     leading_pause = 0.0
 
     def flush() -> Optional[RichSegment]:
-        nonlocal leading_pause
+        nonlocal leading_pause, dropped
         chunk = "".join(buf).strip()
         buf.clear()
         if not chunk:
@@ -244,10 +323,23 @@ def parse_rich_text(text: str, linebreak_pause: float = 0.0) -> List[RichSegment
             emotion=state_emotion,
             rate=state_rate,
             leading_pause=leading_pause,
+            style=state_style,
+            dropped_tags=list(dropped),
         )
+        dropped = []
         leading_pause = 0.0
         segments.append(segment)
         return segment
+
+    def unknown(tag_text: str) -> None:
+        """Handle a tag nothing recognised."""
+        if _DEPRECATED_BREAK_RE.fullmatch(tag_text):
+            dropped.append(f"{tag_text} (deprecated, use [pause:...])")
+            return
+        if preserve_unknown_tags:
+            buf.append(tag_text)
+        else:
+            dropped.append(tag_text)
 
     last = 0
     for match in _TAG_RE.finditer(text):
@@ -258,7 +350,9 @@ def parse_rich_text(text: str, linebreak_pause: float = 0.0) -> List[RichSegment
         if emotion_name is not None:
             key = normalize_emotion(emotion_name)
             if key is None:
-                buf.append(match.group(0))
+                # [emotion:...] took the explicit form, so the value was meant
+                # as a preset even when it is not one; treat it as style text.
+                state_style = _join_style(state_style, emotion_name.strip())
                 continue
             flush()
             state_emotion = None if key == "none" else key
@@ -281,9 +375,18 @@ def parse_rich_text(text: str, linebreak_pause: float = 0.0) -> List[RichSegment
                 state_rate = None
             continue
 
+        style_text = match.group("style")
+        if style_text is not None:
+            state_style = _join_style(state_style, style_text.strip())
+            continue
+
+        if match.group("deprecated_break") is not None:
+            dropped.append(f"{match.group(0)} (deprecated, use [pause:...])")
+            continue
+
         key = normalize_emotion(match.group("bare"))
         if key is None:
-            buf.append(match.group(0))
+            unknown(match.group(0))
             continue
         flush()
         state_emotion = None if key == "none" else key
@@ -307,6 +410,7 @@ class SegmentPlan:
     rate: float
     leading_pause: float
     pause_after: float
+    dropped_tags: List[str] = field(default_factory=list)
 
 
 def build_segment_plans(
@@ -348,10 +452,13 @@ def build_segment_plans(
         plans.append(
             SegmentPlan(
                 text=seg.text,
-                instruct=build_emotion_instruct(preset, steer_weight, extra_instruct),
+                instruct=build_emotion_instruct(
+                    preset, steer_weight, extra_instruct, seg.style
+                ),
                 rate=rate,
                 leading_pause=leading,
                 pause_after=tail,
+                dropped_tags=list(seg.dropped_tags),
             )
         )
 

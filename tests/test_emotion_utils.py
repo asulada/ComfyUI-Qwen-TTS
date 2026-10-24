@@ -91,8 +91,16 @@ class RichTextTests(unittest.TestCase):
         segments = parse_rich_text("a[pause:800]b")
         self.assertAlmostEqual(segments[0].pause_after, 0.8)
 
-    def test_break_tag_compat(self):
+    def test_break_tag_is_dropped_with_migration_hint(self):
+        # [break=x] is deprecated; keeping it would make the model read it out.
         segments = parse_rich_text("[break=1.5]Hello")
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].text, "Hello")
+        self.assertAlmostEqual(segments[0].leading_pause, 0.0)
+        self.assertTrue(any("deprecated" in tag for tag in segments[0].dropped_tags))
+
+    def test_pause_tag_is_the_supported_syntax(self):
+        segments = parse_rich_text("[pause:1.5s]Hello")
         self.assertAlmostEqual(segments[0].leading_pause, 1.5)
 
     def test_rate_tag_is_sticky(self):
@@ -103,9 +111,15 @@ class RichTextTests(unittest.TestCase):
         segments = parse_rich_text("[sad]a[none]b")
         self.assertEqual([s.emotion for s in segments], ["sad", None])
 
-    def test_unknown_tag_is_kept_as_text(self):
+    def test_unknown_tag_is_dropped_by_default(self):
         segments = parse_rich_text("[laugh]哈哈哈")
+        self.assertEqual(segments[0].text, "哈哈哈")
+        self.assertEqual(segments[0].dropped_tags, ["[laugh]"])
+
+    def test_unknown_tag_can_be_preserved(self):
+        segments = parse_rich_text("[laugh]哈哈哈", preserve_unknown_tags=True)
         self.assertEqual(segments[0].text, "[laugh]哈哈哈")
+        self.assertEqual(segments[0].dropped_tags, [])
 
     def test_linebreak_becomes_pause(self):
         segments = parse_rich_text("a\nb", linebreak_pause=0.5)
@@ -191,6 +205,64 @@ class TimeStretchTests(unittest.TestCase):
 
         self.assertLess(len(faster), len(wav))
         self.assertGreater(len(slower), len(wav))
+
+
+class StyleTagTests(unittest.TestCase):
+    """[style:...] carries free-form text the preset table does not cover."""
+
+    def test_style_text_reaches_the_plan(self):
+        segments = parse_rich_text("[style:冷笑着压低声音]你确定？")
+        self.assertEqual(segments[0].style, "冷笑着压低声音")
+
+        plans = build_segment_plans(segments)
+        self.assertIn("冷笑着压低声音", plans[0].instruct)
+
+    def test_style_is_sticky(self):
+        segments = parse_rich_text("[style:像在聊天]第一句。第二句。")
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].style, "像在聊天")
+
+    def test_style_stacks_with_preset(self):
+        segments = parse_rich_text("[sad][style:声音发颤]他走了")
+        plans = build_segment_plans(segments)
+        self.assertIn("悲伤", plans[0].instruct)
+        self.assertIn("声音发颤", plans[0].instruct)
+
+    def test_style_precedes_node_level_instruct(self):
+        segments = parse_rich_text("[style:第二项的]台词")
+        plans = build_segment_plans(segments, extra_instruct="节点级的")
+        instruct = plans[0].instruct
+        self.assertLess(instruct.index("第二项的"), instruct.index("节点级的"))
+
+    def test_multiple_style_tags_accumulate(self):
+        segments = parse_rich_text("[style:轻一点][style:再慢一点]台词")
+        self.assertIn("轻一点", segments[0].style)
+        self.assertIn("再慢一点", segments[0].style)
+
+    def test_instruct_alias(self):
+        segments = parse_rich_text("[instruct:压低嗓音]台词")
+        self.assertEqual(segments[0].style, "压低嗓音")
+
+    def test_unknown_emotion_value_becomes_style(self):
+        # [emotion:...] is explicit, so an unrecognised value is still intent.
+        segments = parse_rich_text("[emotion:阴森]台词")
+        self.assertEqual(segments[0].style, "阴森")
+        self.assertIsNone(segments[0].emotion)
+
+    def test_multiword_bare_tag_is_dropped_not_read(self):
+        segments = parse_rich_text("[very slowly]台词")
+        self.assertEqual(segments[0].text, "台词")
+        self.assertTrue(segments[0].dropped_tags)
+
+    def test_dropped_tags_survive_into_plan(self):
+        segments = parse_rich_text("[laugh]台词")
+        plans = build_segment_plans(segments)
+        self.assertEqual(plans[0].dropped_tags, ["[laugh]"])
+
+    def test_dropped_tags_reset_between_segments(self):
+        segments = parse_rich_text("[laugh]甲[sad]乙")
+        self.assertEqual(segments[0].dropped_tags, ["[laugh]"])
+        self.assertEqual(segments[1].dropped_tags, [])
 
 
 if __name__ == "__main__":

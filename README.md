@@ -108,6 +108,7 @@ Synthesize complex dialogues with multiple speakers.
   - `batch_size`: Number of lines to process in parallel (larger = faster but more VRAM).
   - `instruct`: Style instruction applied to every line (e.g. "whispering, very slow"). **The 0.6B model ignores this.**
   - `speed`: Speech rate multiplier (pitch-preserving). 1.0 is the model's native pace; configured pauses are not scaled.
+- **Inline markup**: Every script line accepts the same markup as `EmotionalTTS` (`[sad]` / `[style:...]` / `[pause:800ms]` / `[rate:1.2]`). Markup is resolved per punctuation-delimited fragment, so **one role can change emotion inside a line** while its timbre (`voice_clone_prompt`) stays fixed. A leading `[break=...]` is deprecated; use `[pause:...]`.
 - **Capabilities**: Handles multi-role speech synthesis in a single node, ideal for audiobook narration or roleplay scenarios.
 
 ### 7. Qwen3-TTS Emotional TTS (`EmotionalTTSNode`) [New]
@@ -132,12 +133,16 @@ Layer emotion presets, in-sentence emotion switching, pauses and rate control on
   |--------|--------|-------|
   | `[sad]` `[whisper]` `[emotion:tender]` | Switch emotion | **Sticky**: applies to all following text until changed |
   | `[none]` | Clear emotion | Back to no instruction |
-  | `[pause:800ms]` `[pause:1.2s]` `[break=0.5]` | Insert silence | Attached after the previous segment; at the start it becomes a leading pause |
+  | `[style:laughing under the breath]` `[instruct:...]` | Free-form style | **Sticky**; the text is merged into that segment's instruction, no preset table involved |
+  | `[pause:800ms]` `[pause:1.2s]` | Insert silence | Attached after the previous segment; at the start it becomes a leading pause |
   | `[rate:1.2]` | Switch rate | Also sticky; affects only following segments |
+- **Unknown tags**: stripped by default (otherwise the model reads the brackets aloud) and reported in the log. Use `[style:...]` for anything the preset table does not cover. `preserve_unknown_tags=True` keeps them verbatim.
+- **Deprecated**: `[break=0.5]` is no longer parsed; it is stripped with a hint to use `[pause:0.5s]`.
 - **Example**:
   ```text
   [sad]He left.[pause:800ms]He's never coming back.
   [whisper]Don't make a sound...[pause:1s][tender]I just wanted to see you once more.
+  [style:as if chatting with an old friend]I knew it all along.
   ```
 - **Capabilities**: Suited to audiobooks and character monologues that need emotion shifts inside one scene. Shifts are realized by generating segments separately, so joins are hard cuts (minor timbre/breath discontinuity possible).
 
