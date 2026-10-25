@@ -442,3 +442,29 @@ f0 变异系数在 9.88%–10.34% 之间，三档几乎相同；质心 CV 反而
   实测可挽回 9–10 个半音的系统性偏移。
 - 对「听起来不像一个人」的排查顺序应改为：
   先看 instruct 是否为空 → 再看文本语调差异 → 随机波动的影响最小。
+
+---
+
+## 2026-10-25 · README 改为「上游原文 + 本仓变更记录」双文件
+
+**背景**
+
+本仓库是 `flybirdxx/ComfyUI-Qwen-TTS` 的 fork。此前的做法是直接在 `README.md` /
+`README_CN.md` 里叠加本仓改动（EmotionalTTSNode、多目录声音库、情感最佳实践等），
+导致每次同步上游都要手工合并同一批段落，且无法一眼区分「上游写的」与「本仓写的」。
+
+**决定**
+
+- `README.md` / `README_CN.md` 恢复为上游 `a1328c8` 原文（2026-09-22，
+  Merge PR #109），仅保留顶部一行 Fork 说明指向变更记录；
+- 本仓所有 README 改动迁移到 `README-CHANGE.md` / `README-CHANGE_CN.md`；
+- 今后新增节点或行为变更，**只写变更记录文件**，不再改上游 README。
+
+**影响**
+
+- 同步上游时 `README.md` / `README_CN.md` 可直接覆盖，冲突面只剩顶部一行。
+- 上游 README 因此不描述 `EmotionalTTSNode` 等本仓节点，用户需经顶部链接进入
+  `README-CHANGE*.md`；新增章节时保持两份变更记录的结构对称。
+- 上游 README 仍声明「与 transformers >= 5.0 不兼容」（中文版），而本仓已通过
+  `tools/transformers5_shim.py` 支持 v5；该矛盾现在只由 `README-CHANGE_CN.md`
+  订正。若上游后续修正，可删掉变更记录中的对应条目。

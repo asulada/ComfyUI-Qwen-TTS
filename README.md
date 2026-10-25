@@ -2,6 +2,8 @@
 
 English | [中文版](README_CN.md)
 
+> 🍴 **Fork note**: this repository is a fork of the upstream project. The text below is kept as-is from upstream; every change made in this fork is documented in **[README-CHANGE.md](README-CHANGE.md)**.
+
 > **⚠️ CRITICAL: transformers Version Requirement**
 >
 > Qwen3-TTS works on **transformers 4.57.3 and transformers >= 5** (v5.0+ compatibility is provided by `tools/transformers5_shim.py`, applied automatically on import). On transformers < 5 the shims are no-ops, so the 4.57.3 path is unchanged:
@@ -106,61 +108,14 @@ Synthesize complex dialogues with multiple speakers.
   - `pause_seconds`: Silence duration between sentences.
   - `merge_outputs`: Merge all dialogue segments into a single long audio.
   - `batch_size`: Number of lines to process in parallel (larger = faster but more VRAM).
-  - `instruct`: Style instruction applied to every line (e.g. "whispering, very slow"). **The 0.6B model ignores this.**
-  - `speed`: Speech rate multiplier (pitch-preserving). 1.0 is the model's native pace; configured pauses are not scaled.
-- **Inline markup**: Every script line accepts the same markup as `EmotionalTTS` (`[sad]` / `[style:...]` / `[pause:800ms]` / `[rate:1.2]`). Markup is resolved per punctuation-delimited fragment, so **one role can change emotion inside a line** while its timbre (`voice_clone_prompt`) stays fixed. A leading `[break=...]` is deprecated; use `[pause:...]`.
 - **Capabilities**: Handles multi-role speech synthesis in a single node, ideal for audiobook narration or roleplay scenarios.
 
-### 7. Qwen3-TTS Emotional TTS (`EmotionalTTSNode`) [New]
-Layer emotion presets, in-sentence emotion switching, pauses and rate control onto a preset speaker.
-
-> ⚠️ Qwen3-TTS has **no** native `emotion` / `steer_weight` / `rate` arguments, no built-in emotion preset table, and no `[excited]`-style emotion tags. This node implements equivalent behaviour on top of the existing inference API, so the result is "instruction-guided + post-processing" rather than an engine-level emotion model.
-
-- **Inputs**:
-  - `text`: Script with optional inline markup (see below).
-  - `speaker`: Preset voice.
-  - `emotion`: Global preset (`happy / sad / angry / whisper / weak / tender / thoughtful / excited / dramatic / news / calm / fearful / gentle / serious`), default `none`.
-  - `steer_weight`: Emotion intensity 0–2. 1.0 = preset as written, >1 amplifies, <1 softens.
-  - `speed`: Global rate multiplier (pitch-preserving); inline `[rate:x]` overrides per segment.
-  - `model_choice`: **Must be 1.7B** — the 0.6B CustomVoice model discards `instruct`, so emotion cannot take effect (the node raises instead of silently ignoring it).
-  - `voice_clone_prompt`: Optional reference timbre (from `VoiceClonePromptNode` / `LoadSpeakerNode`). Connecting it switches to the **Base** model and makes `speaker` inactive; emotions still apply per segment.
-  - `instruct`: Extra description appended to every segment's instruction.
-  - `linebreak_pause`: Silence inserted for each newline.
-  - `scale_pauses_with_speed`: Also scale silences with the rate (default off, so dramatic pauses survive a faster delivery).
-  - `batch_size`: Segments generated per model call.
-- **Inline markup**:
-  | Markup | Effect | Notes |
-  |--------|--------|-------|
-  | `[sad]` `[whisper]` `[emotion:tender]` | Switch emotion | **Sticky**: applies to all following text until changed |
-  | `[none]` | Clear emotion | Back to no instruction |
-  | `[style:laughing under the breath]` `[instruct:...]` | Free-form style | **Sticky**; the text is merged into that segment's instruction, no preset table involved |
-  | `[pause:800ms]` `[pause:1.2s]` | Insert silence | Attached after the previous segment; at the start it becomes a leading pause |
-  | `[rate:1.2]` | Switch rate | Also sticky; affects only following segments |
-- **Unknown tags**: stripped by default (otherwise the model reads the brackets aloud) and reported in the log. Use `[style:...]` for anything the preset table does not cover. `preserve_unknown_tags=True` keeps them verbatim.
-- **Deprecated**: `[break=0.5]` is no longer parsed; it is stripped with a hint to use `[pause:0.5s]`.
-- **Example**:
-  ```text
-  [sad]He left.[pause:800ms]He's never coming back.
-  [whisper]Don't make a sound...[pause:1s][tender]I just wanted to see you once more.
-  [style:as if chatting with an old friend]I knew it all along.
-  ```
-- **Capabilities**: Suited to audiobooks and character monologues that need emotion shifts inside one scene. Shifts are realized by generating segments separately, so joins are hard cuts (minor timbre/breath discontinuity possible).
-
-### 8. Qwen3-TTS Load Speaker (`LoadSpeakerNode`) [New]
+### 7. Qwen3-TTS Load Speaker (`LoadSpeakerNode`) [New]
 Load saved voice features and metadata with zero configuration.
-- **Inputs**:
-  - `filename`: Every voice found in the scanned directories, shown as `<label>/<file>` so two libraries with the same filename stay distinguishable.
-  - `directory` (optional): An extra directory to scan. Absolute, or relative to `models/qwen-tts`. It affects the dropdown after the next workflow reload.
-  - `file_path` (optional): An absolute path or `<label>/<file>` that overrides the dropdown — use it to load a just-saved voice without reloading.
-- **Scanned directories**, in order: `models/qwen-tts/voices`, every root registered for the `qwen-tts` folder type (including `extra_model_paths.yaml`, checking both the root and its `voices/` child), each path in `QWEN_TTS_VOICE_DIRS` (`os.pathsep`-separated), then the node's own `directory`.
 - **Capabilities**: Enables a "Select & Play" experience by auto-loading pre-computed features and metadata.
 
-### 9. Qwen3-TTS Save Voice (`SaveVoiceNode`) [New]
+### 8. Qwen3-TTS Save Voice (`SaveVoiceNode`) [New]
 Persist extracted voice features and metadata to disk for future use.
-- **Inputs**:
-  - `output_dir` (optional): Empty keeps the historical `models/qwen-tts/voices`. A relative value goes under `models/qwen-tts/`, an absolute value is used as-is. The directory is created when missing.
-  - `subfolder` (optional): A sub-directory inside `output_dir`, e.g. `audiobook/ch1`.
-  - `overwrite` (optional): Refuse to clobber an existing voice when disabled.
 - **Capabilities**: Build a permanent voice library for reuse via `LoadSpeakerNode`.
 
 ## Attention Mechanisms
