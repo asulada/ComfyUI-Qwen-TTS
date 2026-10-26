@@ -310,6 +310,7 @@ def expand_dialogue_line(
     steer_weight: float = 1.0,
     global_rate: float = 1.0,
     scale_pauses_with_speed: bool = False,
+    voice_card: str = "",
 ) -> List[Tuple[str, str, float, float, List[str], float]]:
     """Turn one dialogue line into generation units.
 
@@ -321,6 +322,11 @@ def expand_dialogue_line(
     across punctuation inside one line; each resulting segment is then split by
     punctuation so every fragment keeps its own pause.  Doing it the other way
     round cuts a sticky tag off at the first full stop.
+
+    ``voice_card`` is the speaking role's own description, kept in the role bank.
+    It is applied to every line that role speaks, so a multi-role script does not
+    have to share one global ``instruct`` across characters of different age and
+    pitch range.
 
     ``rate`` is returned per unit so the caller can stretch each fragment
     individually; before this it was silently dropped and only the node-level
@@ -346,7 +352,9 @@ def expand_dialogue_line(
         if rate <= 0:
             rate = 1.0
 
-        instruct = build_emotion_instruct(preset, steer_weight, extra_instruct, seg.style)
+        instruct = build_emotion_instruct(
+            preset, steer_weight, extra_instruct, seg.style, voice_card
+        )
         last = len(fragments) - 1
 
         for index, (fragment, fragment_pause) in enumerate(fragments):
@@ -1502,6 +1510,16 @@ class RoleBankNode:
         for i in range(1, 9):
             inputs["optional"][f"role_name_{i}"] = ("STRING", {"default": f"Role{i}"})
             inputs["optional"][f"prompt_{i}"] = ("VOICE_CLONE_PROMPT",)
+            inputs["optional"][f"instruct_{i}"] = ("STRING", {
+                "multiline": True,
+                "default": "",
+                "placeholder": "声线卡：年龄/音区/音色/语速/口音，如「二十出头，中高音区，音色清亮，语速中等」",
+                "tooltip": (
+                    "Per-role voice card, applied to every line this role speaks. "
+                    "Lets each character keep its own pitch range instead of sharing "
+                    "one global instruct. Leave empty to fall back to the node-level instruct."
+                ),
+            })
         return inputs
 
     RETURN_TYPES = ("QWEN3_ROLE_BANK",)
@@ -1515,9 +1533,29 @@ class RoleBankNode:
         for i in range(1, 9):
             name = kwargs.get(f"role_name_{i}", "").strip()
             prompt = kwargs.get(f"prompt_{i}")
-            if name and prompt is not None:
-                bank[name] = prompt
+            if not name or prompt is None:
+                continue
+            card = (kwargs.get(f"instruct_{i}") or "").strip()
+            # Keep the bare prompt for roles without a card so existing
+            # workflows (and any consumer expecting a prompt directly) keep
+            # working unchanged.
+            bank[name] = {"prompt": prompt, "instruct": card} if card else prompt
         return (bank,)
+
+
+def unpack_role(role_data: Any) -> Tuple[Any, str]:
+    """Split a role-bank entry into ``(voice_clone_prompt, voice_card)``.
+
+    Accepts all three shapes a bank entry can have: a bare packaged prompt dict,
+    a list of prompt items, or the ``{"prompt": ..., "instruct": ...}`` wrapper
+    written by ``RoleBankNode`` when a per-role voice card is set.
+    """
+    if isinstance(role_data, dict) and "prompt" in role_data:
+        card = role_data.get("instruct", "")
+        return role_data["prompt"], (card or "").strip()
+    if isinstance(role_data, list):
+        return role_data[0] if role_data else None, ""
+    return role_data, ""
 
 
 class DialogueInferenceNode:
@@ -1572,7 +1610,13 @@ class DialogueInferenceNode:
         if not script or not role_bank:
             raise RuntimeError("Script and Role Bank are required")
 
-        warn_on_missing_instruct(instruct, True, "DialogueInference")
+        # A per-role voice card satisfies the same need as the node-level
+        # instruct, so only warn when neither is present anywhere.
+        has_role_card = any(
+            unpack_role(entry)[1] for entry in role_bank.values()
+        )
+        if not has_role_card:
+            warn_on_missing_instruct(instruct, True, "DialogueInference")
 
         pbar = ProgressBar(3)
 
@@ -1632,12 +1676,10 @@ class DialogueInferenceNode:
                 continue
 
             text, leading_pause = extract_leading_pause(text)
-            # role_bank[role_name] can be a prompt list OR the new packaged dict (if loaded via RoleBank from LoadSpeaker)
+            # A bank entry is either a bare prompt (no per-role card) or the
+            # {"prompt": ..., "instruct": ...} wrapper written by RoleBankNode.
             role_data = role_bank[role_name]
-            
-            # Extract ref_text if it was passed through RoleBank
-            current_prompt = role_data[0] if isinstance(role_data, list) else role_data
-            current_ref_text = ""
+            current_prompt, voice_card = unpack_role(role_data)
 
             config = {
                 "pause_linebreak": pause_linebreak,
@@ -1648,7 +1690,8 @@ class DialogueInferenceNode:
             }
             
             units = expand_dialogue_line(
-                text, config, extra_instruct=instruct, global_rate=speed
+                text, config, extra_instruct=instruct, global_rate=speed,
+                voice_card=voice_card,
             )
 
             first_generated_segment = True

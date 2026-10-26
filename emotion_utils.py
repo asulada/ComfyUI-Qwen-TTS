@@ -174,25 +174,31 @@ def build_emotion_instruct(
     steer_weight: float = 1.0,
     extra_instruct: str = "",
     style: str = "",
+    voice_card: str = "",
 ) -> str:
     """Compose the ``instruct`` string for one segment.
 
     ``preset`` is a canonical key or any alias; unknown values are treated as
-    "none".  ``extra_instruct`` (the node-level field) is appended after the
-    preset so user text wins on the details it mentions.  ``style`` carries
-    text from inline ``[style:...]`` tags and sits closest to the preset,
-    because it describes this segment specifically.
+    "none".  ``voice_card`` is the per-role description kept in the role bank
+    (who this character is: age, pitch range, accent, speech habits), so it
+    travels with the role instead of being retyped per line.  ``style`` carries
+    text from inline ``[style:...]`` tags and describes this segment only.
+    ``extra_instruct`` is the node-level field and comes last, so the most
+    contextual text has the final say on details it mentions.
     """
     key = normalize_emotion(preset) or "none"
     base = EMOTION_PRESETS.get(key, "").strip()
     extra = (extra_instruct or "").strip()
     inline = (style or "").strip()
+    card = (voice_card or "").strip()
 
     parts: List[str] = []
     if base:
         parts.append(f"{_steer_clause(steer_weight)}{base}")
     if inline:
         parts.append(inline)
+    if card:
+        parts.append(card)
     if extra:
         parts.append(extra)
     return "，".join(parts)

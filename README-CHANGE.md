@@ -28,6 +28,28 @@ Append after `batch_size`:
 - `speed`: Speech rate multiplier (pitch-preserving). 1.0 is the model's native pace; configured pauses are not scaled.
 - **Inline markup**: Every script line accepts the same markup as `EmotionalTTS` (`[sad]` / `[style:...]` / `[pause:800ms]` / `[rate:1.2]`). Markup is resolved **before** the punctuation split, so sticky state (emotion / style / rate) carries across periods and commas, and **one role can change emotion inside a line** while its timbre (`voice_clone_prompt`) stays fixed. `[rate:x]` applies per fragment and overrides the node-level `speed`. A leading `[break=...]` is deprecated; use `[pause:...]`.
 
+> ⚠️ The node-level `instruct` is **global**: it is appended to every line of every
+> role. In a multi-role script, a low-pitched middle-aged character and a bright
+> teenager cannot share one description. Use the per-role voice card below, or put
+> the wording into an inline `[style:...]` tag instead.
+
+### 4. Qwen3-TTS Role Bank (`RoleBankNode`) — per-role voice card
+
+> Refers to upstream §4; only the changed inputs are listed here.
+
+Add an `instruct_{i}` input (multiline) after `role_name_i` / `prompt_i`:
+
+- `instruct_{i}`: this role's voice card, e.g. "early twenties, mid-high pitch,
+  bright timbre, medium pace". Applied to **every line that role speaks**, so it
+  does not have to be retyped per line. Leave empty to fall back to the
+  node-level `instruct`.
+
+Composition order is: emotion preset → inline `[style:...]` → **voice card** →
+node-level `instruct`, later entries being more specific and taking precedence.
+
+Roles without a card keep the bare prompt in `role_bank`, so **existing workflows
+need no changes**.
+
 ### 7. Qwen3-TTS Emotional TTS (`EmotionalTTSNode`) [New] — new section
 
 Insert as §7, i.e. before Load Speaker; the upstream §7 / §8 (Load Speaker / Save Voice)
