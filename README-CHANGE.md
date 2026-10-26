@@ -26,7 +26,7 @@ Append after `batch_size`:
 
 - `instruct`: Style instruction applied to every line (e.g. "whispering, very slow"). **The 0.6B model ignores this.**
 - `speed`: Speech rate multiplier (pitch-preserving). 1.0 is the model's native pace; configured pauses are not scaled.
-- **Inline markup**: Every script line accepts the same markup as `EmotionalTTS` (`[sad]` / `[style:...]` / `[pause:800ms]` / `[rate:1.2]`). Markup is resolved per punctuation-delimited fragment, so **one role can change emotion inside a line** while its timbre (`voice_clone_prompt`) stays fixed. A leading `[break=...]` is deprecated; use `[pause:...]`.
+- **Inline markup**: Every script line accepts the same markup as `EmotionalTTS` (`[sad]` / `[style:...]` / `[pause:800ms]` / `[rate:1.2]`). Markup is resolved **before** the punctuation split, so sticky state (emotion / style / rate) carries across periods and commas, and **one role can change emotion inside a line** while its timbre (`voice_clone_prompt`) stays fixed. `[rate:x]` applies per fragment and overrides the node-level `speed`. A leading `[break=...]` is deprecated; use `[pause:...]`.
 
 ### 7. Qwen3-TTS Emotional TTS (`EmotionalTTSNode`) [New] — new section
 

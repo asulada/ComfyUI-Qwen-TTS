@@ -468,3 +468,59 @@ f0 变异系数在 9.88%–10.34% 之间，三档几乎相同；质心 CV 反而
 - 上游 README 仍声明「与 transformers >= 5.0 不兼容」（中文版），而本仓已通过
   `tools/transformers5_shim.py` 支持 v5；该矛盾现在只由 `README-CHANGE_CN.md`
   订正。若上游后续修正，可删掉变更记录中的对应条目。
+
+---
+
+## 2026-10-26 · 修复 Dialogue 的两个静默失效：`[rate:]` 被丢弃、粘滞状态跨标点丢失
+
+**背景**
+
+用户反馈「Dialogue 为什么不能单独加速，只能整段加速」。排查后发现两个缺陷，
+都是引入 `expand_dialogue_line()` 时带入的，且都不会报错、只在听感/行为上偏离预期。
+
+**缺陷一：`[rate:x]` 静默失效**
+
+`expand_dialogue_line` 返回五元组，没有把 `parse_rich_text` 算出的 `plan.rate`
+带出来；调用端只能对整段套用节点级 `speed`：
+
+```python
+waveform = torch.from_numpy(time_stretch(wav, speed)).float()
+```
+
+`[rate:1.5]` 能被正则解析、不报错、不告警，值被丢弃。
+
+**缺陷二：粘滞状态在第一个标点处断掉**
+
+切分顺序是「先按标点切 → 再对每段解析标签」。而 `[sad]` / `[style:]` / `[rate:]`
+的粘滞语义依赖 `parse_rich_text` 在一次调用内维持状态。两遍切开后，
+第一段之后的片段拿不到状态：
+
+```text
+[sad]第一句。第二句。
+  → 第一句 instruct='低沉悲伤…'   ✅
+  → 第二句 instruct=''            ❌
+```
+
+**决定**
+
+1. **调换两遍的顺序**：先 `parse_rich_text` 解析标记（粘滞状态完整），
+   再对每段文本调用 `split_text_by_pauses` 切标点。标点停顿语义不变。
+2. **元组扩为六项**，末尾加 `rate`；新增 `rates_to_gen` / `chunk_rates`，
+   逐片段调用 `time_stretch`。优先级：`[rate:x]` > 节点级 `speed`。
+3. `scale_pauses_with_speed` 在 `expand_dialogue_line` 内按片段 rate 生效。
+4. 段落级 `leading_pause` 只落在该段第一个片段上，`pause_after` 只落在最后一个片段上，
+   避免重复插入静音。
+5. `dropped_tags` 每段只上报一次（挂在第一个片段上）。
+
+**影响**
+
+- `[rate:x]` 在 Dialogue 中真正生效，与 `EmotionalTTS` 行为对齐。
+- 一行内的 `[sad]` / `[style:]` 现在覆盖整行，直到被下一个标签覆盖——
+  这才是文档里一直宣称的「粘滞」语义。
+- **行为变更**：此前只有首句带情感的脚本，现在整行都会带。旧脚本若依赖
+  「标签只管一句」，需要显式改用 `[none]` 复位。
+- 测试：`tests/test_dialogue_markup.py` 13 → 26 例，新增
+  `StickyAcrossPunctuationTests`（6 例）与 `PerFragmentRateTests`（7 例）。
+- 文档：`README-CHANGE.md` / `README-CHANGE_CN.md` 的解析顺序描述由
+  「按标点切分后的片段逐一解析」改为「先解析标记、再按标点切分」，
+  并补充 `[rate:x]` 逐片段生效、优先于 `speed`。

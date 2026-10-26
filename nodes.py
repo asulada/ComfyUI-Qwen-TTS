@@ -26,6 +26,9 @@ from .voice_store import (
 )
 from .emotion_utils import (
     EMOTION_CHOICES,
+    RichSegment,
+    SegmentPlan,
+    build_emotion_instruct,
     build_segment_plans,
     parse_rich_text,
     time_stretch,
@@ -303,37 +306,71 @@ def expand_dialogue_line(
     text: str,
     pause_config: Dict[str, float],
     extra_instruct: str = "",
-) -> List[Tuple[str, str, float, float, List[str]]]:
+    global_emotion: str = "none",
+    steer_weight: float = 1.0,
+    global_rate: float = 1.0,
+    scale_pauses_with_speed: bool = False,
+) -> List[Tuple[str, str, float, float, List[str], float]]:
     """Turn one dialogue line into generation units.
 
-    Returns ``(speech_text, instruct, leading_pause, pause_after, dropped)`` per
-    unit.  Two splitting passes run in order:
+    Returns ``(speech_text, instruct, leading_pause, pause_after, dropped, rate)``
+    per unit.
 
-    1. ``split_text_by_pauses`` splits on punctuation so each fragment can carry
-       its own pause (an existing behaviour that keeps prosody natural);
-    2. ``parse_rich_text`` resolves inline markup inside each fragment, so
-       ``[sad]``/``[style:...]`` can change the delivery mid-line while the
-       speaker — and therefore the cloned timbre — stays the same.
+    Order matters here.  Markup is resolved **first** by ``parse_rich_text``, so
+    sticky state such as ``[sad]`` / ``[style:...]`` / ``[rate:...]`` carries
+    across punctuation inside one line; each resulting segment is then split by
+    punctuation so every fragment keeps its own pause.  Doing it the other way
+    round cuts a sticky tag off at the first full stop.
+
+    ``rate`` is returned per unit so the caller can stretch each fragment
+    individually; before this it was silently dropped and only the node-level
+    ``speed`` had any effect.
 
     Trailing flat punctuation is stripped to avoid robotic intonation drops on
     short pieces; ``?`` and ``!`` are kept because they carry the contour.
 
     Kept free of ComfyUI/torch so it can be unit-tested directly.
     """
-    units: List[Tuple[str, str, float, float, List[str]]] = []
-    for segment_text, segment_pause in split_text_by_pauses(text, pause_config):
-        if not re.sub(r"[^\w\u4e00-\u9fa5]", "", segment_text).strip():
+    units: List[Tuple[str, str, float, float, List[str], float]] = []
+
+    for seg in parse_rich_text(text):
+        fragments = split_text_by_pauses(seg.text, pause_config)
+        if not fragments:
             continue
-        for plan in build_segment_plans(parse_rich_text(segment_text),
-                                        extra_instruct=extra_instruct):
-            piece = re.sub(r"[\.,，。…\-—]+$", "", plan.text).strip() or plan.text
+
+        preset = seg.emotion if seg.emotion is not None else global_emotion
+        try:
+            rate = float(seg.rate if seg.rate is not None else global_rate)
+        except (TypeError, ValueError):
+            rate = 1.0
+        if rate <= 0:
+            rate = 1.0
+
+        instruct = build_emotion_instruct(preset, steer_weight, extra_instruct, seg.style)
+        last = len(fragments) - 1
+
+        for index, (fragment, fragment_pause) in enumerate(fragments):
+            if not re.sub(r"[^\w\u4e00-\u9fa5]", "", fragment).strip():
+                continue
+            piece = re.sub(r"[\.,，。…\-—]+$", "", fragment).strip() or fragment
+
+            leading = seg.leading_pause if index == 0 else 0.0
+            tail = fragment_pause
+            if index == last:
+                tail += seg.pause_after
+            if scale_pauses_with_speed:
+                leading /= rate
+                tail /= rate
+
             units.append((
                 piece,
-                plan.instruct,
-                plan.leading_pause,
-                segment_pause + plan.pause_after,
-                list(plan.dropped_tags),
+                instruct,
+                leading,
+                tail,
+                list(seg.dropped_tags) if index == 0 else [],
+                rate,
             ))
+
     return units
 
 
@@ -1565,6 +1602,7 @@ class DialogueInferenceNode:
         leading_pauses_to_gen = []
         pauses_to_gen = []
         instructs_to_gen = []
+        rates_to_gen = []
 
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
 
@@ -1609,14 +1647,17 @@ class DialogueInferenceNode:
                 "hyphen_pause": hyphen_pause
             }
             
-            units = expand_dialogue_line(text, config, extra_instruct=instruct)
+            units = expand_dialogue_line(
+                text, config, extra_instruct=instruct, global_rate=speed
+            )
 
             first_generated_segment = True
-            for piece, piece_instruct, piece_lead, piece_pause, dropped in units:
+            for piece, piece_instruct, piece_lead, piece_pause, dropped, piece_rate in units:
                 texts_to_gen.append(piece)
                 prompts_to_gen.append(current_prompt)
                 langs_to_gen.append(mapped_lang)
                 instructs_to_gen.append(piece_instruct)
+                rates_to_gen.append(piece_rate)
                 leading_pauses_to_gen.append(
                     leading_pause + piece_lead if first_generated_segment else piece_lead
                 )
@@ -1652,6 +1693,7 @@ class DialogueInferenceNode:
                 chunk_leading_pauses = leading_pauses_to_gen[i:i + batch_size]
                 chunk_pauses = pauses_to_gen[i:i + batch_size]
                 chunk_instructs = instructs_to_gen[i:i + batch_size]
+                chunk_rates = rates_to_gen[i:i + batch_size]
 
                 current_chunk = i // batch_size + 1
                 print(f"[Qwen3-TTS] Running batched inference for chunk {current_chunk} of {num_chunks}...")
@@ -1669,7 +1711,10 @@ class DialogueInferenceNode:
                 )
 
                 for j, wav in enumerate(wavs_list):
-                    waveform = torch.from_numpy(time_stretch(wav, speed)).float()
+                    # Per-fragment rate: [rate:x] inside a line wins over the
+                    # node-level speed, which expand_dialogue_line already used
+                    # as the fallback.
+                    waveform = torch.from_numpy(time_stretch(wav, chunk_rates[j])).float()
                     if waveform.ndim == 1:
                         waveform = waveform.unsqueeze(0).unsqueeze(0)
                     elif waveform.ndim == 2:

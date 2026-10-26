@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from emotion_utils import (  # noqa: E402
+    build_emotion_instruct,
     build_segment_plans,
     parse_rich_text,
     time_stretch,
@@ -34,6 +35,7 @@ def _load_expand():
     namespace = {
         "Dict": dict, "List": list, "Tuple": tuple, "re": __import__("re"),
         "build_segment_plans": build_segment_plans,
+        "build_emotion_instruct": build_emotion_instruct,
         "parse_rich_text": parse_rich_text,
     }
     exec(compile(ast.Module(body=picked, type_ignores=[]),
@@ -53,7 +55,7 @@ class PlainLineTests(unittest.TestCase):
     def test_no_markup_is_a_single_unit(self):
         units = expand_dialogue_line("你好世界", NO_PAUSES)
         self.assertEqual(len(units), 1)
-        text, instruct, _lead, _pause, _dropped = units[0]
+        text, instruct, _lead, _pause, _dropped, _rate = units[0]
         self.assertEqual(text, "你好世界")
         self.assertEqual(instruct, "")
 
@@ -132,6 +134,89 @@ class InstructIsolationTests(unittest.TestCase):
         self.assertEqual(units[1][0], "第二段第三段")
         self.assertIn("带笑", units[1][1])
         self.assertIn("悲伤", units[1][1])
+
+
+class StickyAcrossPunctuationTests(unittest.TestCase):
+    """Sticky state must survive the punctuation split.
+
+    Regression: markup used to be resolved *after* `split_text_by_pauses`, so a
+    `[sad]` at the start of a line was cut off at the first full stop and only
+    the first fragment got the instruction.  Markup is now resolved first.
+    """
+
+    PAUSES = dict(NO_PAUSES, period_pause=0.4)
+
+    def test_emotion_carries_past_a_period(self):
+        units = expand_dialogue_line("[sad]第一句。第二句。", self.PAUSES)
+        self.assertEqual(len(units), 2)
+        for unit in units:
+            self.assertIn("悲伤", unit[1])
+
+    def test_style_carries_past_a_period(self):
+        units = expand_dialogue_line("[style:压低嗓音]第一句。第二句。", self.PAUSES)
+        self.assertEqual(len(units), 2)
+        for unit in units:
+            self.assertIn("压低嗓音", unit[1])
+
+    def test_emotion_carries_past_a_comma(self):
+        config = dict(NO_PAUSES, comma_pause=0.2)
+        units = expand_dialogue_line("[sad]第一句，第二句。", config)
+        self.assertEqual(len(units), 2)
+        self.assertTrue(all("悲伤" in u[1] for u in units if u[1]))
+
+    def test_later_tag_still_overrides(self):
+        units = expand_dialogue_line("[sad]第一句。[tender]第二句。", self.PAUSES)
+        self.assertIn("悲伤", units[0][1])
+        self.assertNotIn("悲伤", units[1][1])
+
+    def test_dropped_tag_reported_once_per_segment(self):
+        units = expand_dialogue_line("[laugh]第一句。第二句。", self.PAUSES)
+        reported = [u[4] for u in units]
+        self.assertEqual(reported[0], ["[laugh]"])
+        self.assertEqual(reported[1], [])
+
+    def test_leading_pause_only_on_first_fragment(self):
+        units = expand_dialogue_line("[pause:500ms]第一句。第二句。", self.PAUSES)
+        self.assertAlmostEqual(units[0][2], 0.5)
+        self.assertAlmostEqual(units[1][2], 0.0)
+
+
+class PerFragmentRateTests(unittest.TestCase):
+    """[rate:x] must reach the caller; it used to be silently dropped."""
+
+    def test_rate_is_returned(self):
+        units = expand_dialogue_line("[rate:1.5]快一点。", NO_PAUSES)
+        self.assertAlmostEqual(units[0][5], 1.5)
+
+    def test_rate_defaults_to_global(self):
+        units = expand_dialogue_line("正常速度。", NO_PAUSES, global_rate=1.2)
+        self.assertAlmostEqual(units[0][5], 1.2)
+
+    def test_rate_falls_back_to_one_when_global_is_zero(self):
+        units = expand_dialogue_line("文本。", NO_PAUSES, global_rate=0.0)
+        self.assertAlmostEqual(units[0][5], 1.0)
+
+    def test_rate_is_sticky_within_a_line(self):
+        config = dict(NO_PAUSES, period_pause=0.4)
+        units = expand_dialogue_line("[rate:0.8]第一句。第二句。", config)
+        self.assertTrue(all(u[5] == 0.8 for u in units))
+
+    def test_rate_changes_mid_line(self):
+        config = dict(NO_PAUSES, period_pause=0.4)
+        units = expand_dialogue_line("[rate:1.4]快。\n[rate:0.7]慢。", config)
+        self.assertEqual(units[0][5], 1.4)
+        self.assertEqual(units[1][5], 0.7)
+
+    def test_pauses_scale_with_rate_when_requested(self):
+        config = dict(NO_PAUSES, period_pause=1.0)
+        units = expand_dialogue_line("[rate:2.0]第一句。第二句。", config,
+                                     scale_pauses_with_speed=True)
+        self.assertAlmostEqual(units[0][3], 0.5)
+
+    def test_pauses_untouched_by_default(self):
+        config = dict(NO_PAUSES, period_pause=1.0)
+        units = expand_dialogue_line("[rate:2.0]第一句。第二句。", config)
+        self.assertAlmostEqual(units[0][3], 1.0)
 
 
 if __name__ == "__main__":
