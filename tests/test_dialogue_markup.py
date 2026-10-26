@@ -24,26 +24,36 @@ from emotion_utils import (  # noqa: E402
 )
 
 
-def _load_expand():
+def _load_nodes_helpers():
+    """Extract the pure helper functions from nodes.py.
+
+    nodes.py imports torch/folder_paths/comfy at module level, so it cannot be
+    imported directly in a bare test environment.  These helpers are deliberately
+    free of those dependencies, which lets the parser behaviour be tested without
+    a ComfyUI install.
+    """
     source = (ROOT / "nodes.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"expand_dialogue_line", "split_text_by_pauses"}
+    wanted = {"expand_dialogue_line", "split_text_by_pauses", "unpack_role"}
     picked = [
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted
     ]
     namespace = {
-        "Dict": dict, "List": list, "Tuple": tuple, "re": __import__("re"),
+        "Dict": dict, "List": list, "Tuple": tuple, "Any": object,
+        "re": __import__("re"),
         "build_segment_plans": build_segment_plans,
         "build_emotion_instruct": build_emotion_instruct,
         "parse_rich_text": parse_rich_text,
     }
     exec(compile(ast.Module(body=picked, type_ignores=[]),
                  str(ROOT / "nodes.py"), "exec"), namespace)
-    return namespace["expand_dialogue_line"]
+    return namespace
 
 
-expand_dialogue_line = _load_expand()
+_helpers = _load_nodes_helpers()
+expand_dialogue_line = _helpers["expand_dialogue_line"]
+unpack_role = _helpers["unpack_role"]
 
 NO_PAUSES = {
     "pause_linebreak": 0.0, "period_pause": 0.0, "comma_pause": 0.0,
@@ -217,6 +227,132 @@ class PerFragmentRateTests(unittest.TestCase):
         config = dict(NO_PAUSES, period_pause=1.0)
         units = expand_dialogue_line("[rate:2.0]第一句。第二句。", config)
         self.assertAlmostEqual(units[0][3], 1.0)
+
+
+class RoleVoiceCardTests(unittest.TestCase):
+    """A role can carry its own voice card, so roles need not share one instruct.
+
+    Before this, DialogueInferenceNode had a single node-level `instruct` that was
+    appended to every line, so a low-pitched forty-year-old and a bright-voiced
+    teenager could not both be described correctly.
+    """
+
+    OLD_BOSS = "四十岁男性，低音区，嗓音沙哑，语速偏慢"
+    YOUNG_KID = "十八岁少年，高音区，音色清亮，语速略快"
+
+    def test_voice_card_reaches_instruct(self):
+        units = expand_dialogue_line("你再说一遍。", NO_PAUSES, voice_card=self.OLD_BOSS)
+        self.assertIn(self.OLD_BOSS, units[0][1])
+
+    def test_different_roles_get_different_cards(self):
+        boss = expand_dialogue_line("你再说一遍。", NO_PAUSES, voice_card=self.OLD_BOSS)
+        kid = expand_dialogue_line("我错了。", NO_PAUSES, voice_card=self.YOUNG_KID)
+        self.assertIn("四十岁", boss[0][1])
+        self.assertNotIn("四十岁", kid[0][1])
+        self.assertIn("十八岁", kid[0][1])
+        self.assertNotIn("十八岁", boss[0][1])
+
+    def test_card_sits_after_style_and_before_node_instruct(self):
+        units = expand_dialogue_line(
+            "[style:放下戒备]算了。", NO_PAUSES,
+            voice_card=self.OLD_BOSS, extra_instruct="全局补充",
+        )
+        instruct = units[0][1]
+        self.assertLess(instruct.index("放下戒备"), instruct.index("四十岁"))
+        self.assertLess(instruct.index("四十岁"), instruct.index("全局补充"))
+
+    def test_card_stacks_with_emotion_preset(self):
+        units = expand_dialogue_line("[angry]你再说一遍。", NO_PAUSES,
+                                     voice_card=self.OLD_BOSS)
+        instruct = units[0][1]
+        self.assertIn("愤怒", instruct)
+        self.assertIn(self.OLD_BOSS, instruct)
+
+    def test_card_covers_every_fragment_of_a_line(self):
+        config = dict(NO_PAUSES, period_pause=0.4)
+        units = expand_dialogue_line("第一句。第二句。", config, voice_card=self.OLD_BOSS)
+        self.assertEqual(len(units), 2)
+        for unit in units:
+            self.assertIn(self.OLD_BOSS, unit[1])
+
+    def test_empty_card_is_a_no_op(self):
+        with_card = expand_dialogue_line("他走了。", NO_PAUSES, voice_card="")
+        without = expand_dialogue_line("他走了。", NO_PAUSES)
+        self.assertEqual(with_card[0][1], without[0][1])
+
+
+class UnpackRoleTests(unittest.TestCase):
+    """Bank entries must work in all three shapes that can reach the node."""
+
+    def test_bare_prompt_dict_has_no_card(self):
+        entry = {"prompt": "ignored", "x_vector_only_mode": False, "ref_text": "x"}
+        # A packaged prompt dict is returned as-is; only the {"prompt": ...}
+        # wrapper introduced for voice cards is unpacked.
+        prompt, card = unpack_role({"ref_code": "c", "x_vector_only_mode": False})
+        self.assertEqual(card, "")
+        self.assertIsInstance(prompt, dict)
+
+    def test_list_returns_first_item(self):
+        prompt, card = unpack_role(["item-a", "item-b"])
+        self.assertEqual(prompt, "item-a")
+        self.assertEqual(card, "")
+
+    def test_wrapper_with_card(self):
+        prompt, card = unpack_role({"prompt": "P", "instruct": self.OLD})
+        self.assertEqual(prompt, "P")
+        self.assertEqual(card, self.OLD)
+
+    def test_wrapper_without_card(self):
+        prompt, card = unpack_role({"prompt": "P", "instruct": ""})
+        self.assertEqual(prompt, "P")
+        self.assertEqual(card, "")
+
+    def test_wrapper_missing_instruct_key(self):
+        prompt, card = unpack_role({"prompt": "P"})
+        self.assertEqual(prompt, "P")
+        self.assertEqual(card, "")
+
+    def test_scalar_passes_through(self):
+        prompt, card = unpack_role("raw")
+        self.assertEqual(prompt, "raw")
+        self.assertEqual(card, "")
+
+    # --- regression: a card must not change the prompt's *shape* -------------
+    # DialogueInferenceNode repeats one prompt per line to build a batch, and
+    # the model indexes it as a list of prompt items.  When the card branch
+    # returned the list unwrapped, the batch became [[item], [item]] and
+    # generation died on `it.ref_code`.  Bare and wrapped entries must hand
+    # back the same single item.
+
+    def test_wrapper_containing_a_prompt_list_is_unwrapped(self):
+        item = object()
+        prompt, card = unpack_role({"prompt": [item], "instruct": self.OLD})
+        self.assertIs(prompt, item)
+        self.assertEqual(card, self.OLD)
+
+    def test_wrapped_and_bare_prompt_have_the_same_shape(self):
+        item = object()
+        bare_prompt, _ = unpack_role([item])
+        wrapped_prompt, _ = unpack_role({"prompt": [item], "instruct": self.OLD})
+        self.assertIs(bare_prompt, wrapped_prompt)
+
+    def test_wrapped_multi_item_list_still_yields_one_item(self):
+        # One role has one voice; a stray multi-item list must not leak a batch
+        # dimension into the per-line batch.
+        prompt, _ = unpack_role({"prompt": ["a", "b"], "instruct": self.OLD})
+        self.assertEqual(prompt, "a")
+
+    def test_wrapped_empty_list_is_none(self):
+        prompt, card = unpack_role({"prompt": [], "instruct": self.OLD})
+        self.assertIsNone(prompt)
+        self.assertEqual(card, self.OLD)
+
+    def test_bare_empty_list_is_none(self):
+        prompt, card = unpack_role([])
+        self.assertIsNone(prompt)
+        self.assertEqual(card, "")
+
+    OLD = "四十岁男性，低音区"
 
 
 if __name__ == "__main__":

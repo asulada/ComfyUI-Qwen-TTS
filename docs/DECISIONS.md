@@ -605,3 +605,45 @@ waveform = torch.from_numpy(time_stretch(wav, speed)).float()
   `test_cuda_compatibility`（既有环境问题）。
 - 文档：`README-CHANGE.md` / `README-CHANGE_CN.md` 的 §6 增加全局 instruct 的
   警示，并新增 §4 RoleBank 的声线卡说明。
+
+---
+
+## 2026-10-26 · 声线卡合成报错的根因：`unpack_role` 的带卡分支没做单条归一化
+
+**背景**
+
+上一节上线后，用户反馈：`RoleBank` 的 `instruct_{i}` **只要填了值**，
+`DialogueInference` 合成就报错；同一工作流把该字段清空则正常。
+现象与 `instruct` 文本内容、模型大小（0.6B/1.7B）无关，纯粹由「填了没填」决定。
+
+**根因**
+
+`prompt_{i}` 接的是 `VoiceClonePromptNode` / `LoadSpeakerNode`，返回
+`List[VoiceClonePromptItem]`（单元素列表）。`unpack_role` 两个分支的归一化不一致：
+
+| bank 形态 | 触发条件 | 旧返回值 | 每行复用它组成的 batch | 模型侧 `it.ref_code` |
+|---|---|---|---|---|
+| 裸 prompt（list） | `instruct_{i}` 为空 | `list[0]` = item | `[item, item]` ✅ | 正常 |
+| `{"prompt": list, "instruct": ...}` | `instruct_{i}` 非空 | **整个 list** | `[[item], [item]]` ❌ | `'list' object has no attribute 'ref_code'` |
+
+即带卡分支把列表原样返回，`DialogueInferenceNode` 再按行重复一次，
+把 prompt 列表**嵌进**了批维度。`qwen_tts/inference/qwen3_tts_model.py:460`
+的 `_prompt_items_to_voice_clone_prompt` 逐项取 `it.ref_code`，于是炸在 list 上。
+所以 `instruct` 只是「走没走带卡分支」的开关，本身没有毒。
+
+**决定**
+
+`unpack_role` 抽出一个 `single()` 对内归一化，**两个分支统一返回单条 prompt**
+（或打包 dict），不再返回列表。语义定为：role bank 里一个角色只有一个声音，
+多余元素不会泄漏成批维度。
+
+**影响**
+
+- 填了声线卡的角色恢复正常合成，声线卡内容照旧进入 `instruct`。
+- 边界：`{"prompt": [], ...}` 与裸 `[]` 均返回 `None`（此前裸 `[]` 已返回 None，
+  带卡 `[]` 会返回 `[]`，同样会炸）。
+- `tests/test_dialogue_markup.py` 新增 5 例回归（`UnpackRoleTests` 43 例总计）：
+  带卡包装内的列表被拆包、裸/带卡返回值同形、多元素取首个、空列表为 `None`。
+- 教训：只要两种入参形态汇入同一批处理路径，**归一化必须发生在解包处**，
+  不能依赖下游「反正都是 prompt」的假设；下游按 `it.ref_code` 索引，
+  对形状差异零容忍。

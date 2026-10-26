@@ -1549,13 +1549,24 @@ def unpack_role(role_data: Any) -> Tuple[Any, str]:
     Accepts all three shapes a bank entry can have: a bare packaged prompt dict,
     a list of prompt items, or the ``{"prompt": ..., "instruct": ...}`` wrapper
     written by ``RoleBankNode`` when a per-role voice card is set.
+
+    The returned prompt is always a **single** prompt item (or a packaged dict),
+    never a list, because ``DialogueInferenceNode`` builds a fresh batch out of
+    one prompt per line.  Both branches must therefore normalise the same way:
+    a wrapper carries whatever the user connected to ``prompt_{i}``, which from
+    ``VoiceClonePromptNode`` / ``LoadSpeakerNode`` is a one-element list.
+    Returning that list unwrapped nested the batch (``[[item], [item]]``) and
+    made the model fail on ``it.ref_code``.
     """
+    def single(prompt: Any) -> Any:
+        if isinstance(prompt, list):
+            return prompt[0] if prompt else None
+        return prompt
+
     if isinstance(role_data, dict) and "prompt" in role_data:
         card = role_data.get("instruct", "")
-        return role_data["prompt"], (card or "").strip()
-    if isinstance(role_data, list):
-        return role_data[0] if role_data else None, ""
-    return role_data, ""
+        return single(role_data["prompt"]), (card or "").strip()
+    return single(role_data), ""
 
 
 class DialogueInferenceNode:

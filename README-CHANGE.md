@@ -50,6 +50,9 @@ node-level `instruct`, later entries being more specific and taking precedence.
 Roles without a card keep the bare prompt in `role_bank`, so **existing workflows
 need no changes**.
 
+> Either way a role stores a **single** prompt; the card only contributes text to
+> `instruct` and never changes the prompt's shape.
+
 ### 7. Qwen3-TTS Emotional TTS (`EmotionalTTSNode`) [New] — new section
 
 Insert as §7, i.e. before Load Speaker; the upstream §7 / §8 (Load Speaker / Save Voice)
