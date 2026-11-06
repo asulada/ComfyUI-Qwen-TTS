@@ -36,6 +36,7 @@
 在 `## 📋 更新日志` 首条之前加一行：
 
 - **2026-10-17**: 新增 `EmotionalTTSNode`（情感预设 / 句内情感切换 / 内联停顿 / 语速）；三个 TTS 节点与多角色对话节点支持 `speed`；`DialogueInferenceNode` 补上 `instruct`；`SaveVoice` / `LoadSpeaker` 支持多目录
+- **2026-11-06**: 音色可直接按路径指定（`.qvp` 一等公民）：`VoiceClone` / `EmotionalTTS` / `VoiceClonePrompt` 新增 `ref_voice_path`，`RoleBank` 新增 `voice_path_1..8`，`LoadSpeaker.file_path` 支持 `.qvp` 与裸名
 
 ## 功能特性：新增两条
 
@@ -43,6 +44,42 @@
 
 - 🎭 **情感与语速**: 提供情感预设与内联标记（`[sad]` / `[pause:800ms]` / `[rate:1.2]`），并可对任意节点做保音高变速。
 - 📚 **多目录声音库**: `SaveVoice` / `LoadSpeaker` 可读写多个目录，支持 `extra_model_paths.yaml` 与环境变量。
+- 🔗 **按路径选音色**: 所有需要参考音色的节点都能直接填 `.qvp` 或音频文件路径，不必中转 `LoadSpeaker`。
+
+## 音色路径输入（本次新增）
+
+上游没有「按路径指定音色」的输入，只有 `AUDIO` / `VOICE_CLONE_PROMPT` 连线。本仓库补上字符串路径输入：
+
+| 节点 | 新增输入 | 覆盖对象 |
+|------|----------|----------|
+| `VoiceCloneNode` | `ref_voice_path` | `ref_audio` 与 `voice_clone_prompt` |
+| `EmotionalTTSNode` | `ref_voice_path` | `voice_clone_prompt` |
+| `VoiceClonePromptNode` | `ref_voice_path` | `ref_audio` |
+| `RoleBankNode` | `voice_path_1..8` | 对应角色的 `prompt_N` |
+| `LoadSpeakerNode` | `prompt_file`（下拉） | `filename`（音频下拉） |
+| `LoadSpeakerNode` | `file_path`（语义扩展） | 两个下拉 |
+
+**`LoadSpeaker` 的两个下拉**
+
+- `prompt_file`: 扫描到的 `.qvp`，默认 `None`。**优先于 `filename`**——`.qvp` 就是保存好的 prompt 本身，直通加载、不重编码；
+- `filename`: 音频下拉。**已被 `.qvp` 覆盖的音色会从这个下拉里隐藏**，避免同一个音色出现两条、用户还得猜哪条生效；
+- 取值优先级: `file_path` > `prompt_file` > `filename`。默认值 `"None"` 会被当作空值滤掉，因此旧工作流只选 `filename` 时行为完全不变。
+
+**接受的形式**
+
+1. `.qvp` 绝对路径或相对路径 —— 直接当 prompt 加载，**不加载模型、不重新编码**，音色与当初 `SaveVoice` 保存的逐位一致；
+2. 音频文件（`.wav` / `.mp3` / `.flac` / `.ogg` / `.m4a`）—— 解码后调 `create_voice_clone_prompt` 提取；
+3. `<目录标签>/<文件名>`（下拉框的值）；
+4. 裸名（不含扩展名），按 `.qvp` → 音频的顺序在扫描目录中查找。
+
+**优先级**: 路径非空即生效，并忽略对应节点上的连线，日志会打印一行 `ℹ️ ... ignoring the connected ...`，避免工作流里残留的旧连线悄悄盖掉手填路径。
+
+**`.qvp` 优先于同名音频**: 如果指向音频而旁边存在同名 `.qvp`，`LoadSpeaker` 会读该 `.qvp`。反过来，明确指向 `.qvp` 时不会回落到音频——否则保存时的音色会被无声替换。
+
+**没有 `ref_text` 时**: 音频在 ICL 模式下需要参考文本。填路径时没有地方写文本，若旁边没有同名 `.json`，节点会提示并改用 `x_vector_only`（仅说话人向量）模式。想保住 ICL 质量，请改填 `.qvp`——它自带 `ref_text`。
+
+**`ref_audio` 的位置变化**: `VoiceClonePromptNode` 的 `ref_audio` 从 `required` 移到 `optional`，否则只填路径时节点无法执行。已有工作流把 `ref_audio` 连线后行为不变。
+
 
 ## 节点列表（§6–§9）
 
@@ -124,9 +161,12 @@
 「**输入**: 选择已保存的 `.wav` 文件。」替换为：
 
 - **输入**:
-  - `filename`: 扫描到的全部音色，显示为 `<目录标签>/<文件名>`，同名音色也能区分。
+  - `filename`: 扫描到的音频音色，显示为 `<目录标签>/<文件名>`，同名音色也能区分。已被 `.qvp` 覆盖的音色不在此列表（改在 `prompt_file` 里选）。
+  - `prompt_file`（可选）: 扫描到的 `.qvp`，默认 `None`。**优先于 `filename`**，选中即直通加载。
   - `directory`（可选）: 额外扫描的目录。可填绝对路径，或相对 `models/qwen-tts` 的路径；下拉列表在下次加载工作流时生效。
-  - `file_path`（可选）: 绝对路径或 `<目录标签>/<文件名>`，优先于下拉选择；用于不等刷新就加载刚保存的音色。
+  - `file_path`（可选）: 优先于两个下拉，接受 `.qvp` 路径、音频路径、`<目录标签>/<文件名>`，或不含扩展名的裸名（`.qvp` 优先于音频）。用于不等刷新就加载刚保存的音色。
+- **取值优先级**: `file_path` > `prompt_file` > `filename`。
+- **`.qvp` 直接加载**: 填 `.qvp` 时不再走 `librosa.load`，而是 `torch.load` 出 prompt 直接返回，同目录的 `.wav` 只用于 `audio` 预览输出（没有就返回空 `AUDIO`，不报错）。
 - **扫描顺序**: `models/qwen-tts/voices` → 所有注册为 `qwen-tts` 的根目录（含 `extra_model_paths.yaml`，同时探测根目录与其 `voices/` 子目录）→ 环境变量 `QWEN_TTS_VOICE_DIRS`（用 `os.pathsep` 分隔）→ 节点自身的 `directory`。
 
 ### 9. Qwen3-TTS 保存声音 (`SaveVoiceNode`) [新增] — 编号 + 输入
@@ -137,6 +177,28 @@
   - `output_dir`（可选）: 留空保持原有的 `models/qwen-tts/voices`；相对路径会落在 `models/qwen-tts/` 下；绝对路径原样使用。目录不存在会自动创建。
   - `subfolder`（可选）: `output_dir` 内的子目录，例如 `audiobook/ch1`。
   - `overwrite`（可选）: 关闭后同名音色已存在时报错而不是覆盖。
+  - `instruct`（可选）: 声线卡（音区/音色/语速）。**写进 `.qvp`**，加载时自动恢复，因为 prompt 本身装不下风格文本。
+
+**加载时如何合并 `.qvp` 的卡与手填的 instruct**
+
+两者**拼接**而非互相覆盖，卡在前、手填在后：
+
+```text
+最终 instruct = <卡>，<手填>
+例：二十出头，中高音区，音色清亮，语速中等，这一句要压低声音
+```
+
+- 覆盖会让其中一方静默消失——卡的音高/音色和手填的本次风格都影响听感，丢任一个都会改变声音；
+- 卡在前是因为它是音色的基线，手填是本次的细化，放在最后（模型对靠后的描述权重更高）；
+- 完全重复时不重复拼接：若手填已包含卡、或卡已包含手填，则保留较长的那个，避免「中高音区，中高音区」；
+- `DialogueInference` 同理：`.qvp` 的卡与该角色的 `instruct_N` 拼接，`instruct_N` 在后。
+  - `ref_text`（可选）: 留空 = 保留 prompt 里的转写。**`.qvp` 内嵌值为准**：`VoiceClonePromptItem` 自带它被构建时用的转写，那才是模型实际条件过的文本；手填值只有在 prompt 没有转写时才写入，两者不同会打印警告。
+
+**`.qvp` 的存储格式**
+
+- 新格式是 package dict：`{"prompt": ..., "ref_text": ..., "instruct": ..., "source": ..., "version": "1.2"}`；
+- 旧格式（裸 prompt，无 `ref_text` / `instruct`）**仍可读取**，此时回落到同名 `.json`；
+- 读取优先级统一为「`.qvp` 内嵌值 → 同名 `.json` → 空」。`.json` 降级为纯摘要/兜底，不再是权威来源。
 
 ## 新增「声音库目录」小节
 
@@ -194,3 +256,9 @@ qwen-tts: D:\MyAI\Models\Qwen
 - **多目录**：用 `QWEN_TTS_VOICE_DIRS` 或 `extra_model_paths.yaml` 组织多个声音库，避免把所有音色塞进同一个目录。
 - **子目录归档**：保存时用 `subfolder`（如 `audiobook/ch1`）分组，加载时按 `<目录标签>/<文件名>` 选择。
 - **防覆盖**：批量生成时把 `overwrite` 关掉，重名会直接报错而不是静默覆盖旧样本。
+
+### 音色路径
+- **优先填 `.qvp`，不要填音频**：`.qvp` 是当初保存的 prompt 本身，加载时既不重编码也不会漂移；填音频会重新提取，参考文本缺失时还会退化成仅说话人向量模式。
+- **路径会盖掉连线**：同一节点上既有连线又填了路径时用路径，并在日志里说明；若发现音色不对，先检查是不是忘了清空 `ref_voice_path`。
+- **一部剧一个 `.qvp`**：`VoiceClone` / `EmotionalTTS` / `VoiceClonePrompt` 都能直接填同一条路径，无需为每个节点再挂一个 `LoadSpeaker`。
+- **多角色用 `voice_path_N`**：在 `RoleBankNode` 里给每个角色填 `.qvp`，`DialogueInference` 会按角色各解析一次，200 行的脚本也只有一次加载成本。

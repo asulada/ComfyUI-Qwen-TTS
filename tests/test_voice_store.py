@@ -8,9 +8,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from voice_store import (
+    PROMPT_EXTENSIONS,
+    SOURCE_AUDIO,
+    SOURCE_PROMPT,
+    SOURCE_STEM,
+    audio_stems_without_prompt,
     build_filename_choices,
     collect_voice_dirs,
+    describe_source,
+    detect_source_kind,
     dir_label,
+    list_prompt_files,
     list_voice_files,
     parse_env_dirs,
     read_voice_metadata,
@@ -18,6 +26,7 @@ from voice_store import (
     resolve_bare_name,
     resolve_input_path,
     resolve_output_dir,
+    resolve_voice_source,
     sibling_metadata_paths,
     split_display_name,
 )
@@ -102,6 +111,72 @@ class LabelTests(unittest.TestCase):
         models = os.path.join(os.sep, "m")
         path = os.path.join(os.sep, "lib", "shared", "voices")
         self.assertEqual(dir_label(path, models), "shared")
+
+
+class ListPromptFilesTests(unittest.TestCase):
+    """The .qvp dropdown must not leak into the audio dropdown."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.voices = os.path.join(self.root, "voices")
+        os.makedirs(self.voices)
+        for name in ("hero.wav", "hero.qvp", "solo.qvp", "solo.json", "notes.txt"):
+            open(os.path.join(self.voices, name), "w").close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_prompt_listing_contains_only_qvp(self):
+        displays = [d for d, _ in list_prompt_files([self.voices])]
+        self.assertEqual(displays, ["voices/hero.qvp", "voices/solo.qvp"])
+
+    def test_audio_listing_is_unchanged_by_default(self):
+        # Existing callers must keep seeing audio only.
+        displays = [d for d, _ in list_voice_files([self.voices])]
+        self.assertEqual(displays, ["voices/hero.wav"])
+
+    def test_audio_stems_without_prompt_drops_covered_voices(self):
+        # hero is covered by hero.qvp, so only... nothing remains here.
+        remaining = audio_stems_without_prompt(
+            list_voice_files([self.voices]), list_prompt_files([self.voices])
+        )
+        self.assertEqual(remaining, [])
+
+    def test_audio_stems_without_prompt_keeps_uncovered_voices(self):
+        open(os.path.join(self.voices, "only_audio.wav"), "w").close()
+        remaining = audio_stems_without_prompt(
+            list_voice_files([self.voices]), list_prompt_files([self.voices])
+        )
+        self.assertEqual([d for d, _ in remaining], ["voices/only_audio.wav"])
+
+    def test_no_prompts_means_audio_unchanged(self):
+        remaining = audio_stems_without_prompt(list_voice_files([self.voices]), [])
+        self.assertEqual([d for d, _ in remaining], ["voices/hero.wav"])
+
+    def test_prompt_and_audio_dropdowns_have_no_duplicate_voice(self):
+        prompts = [d for d, _ in list_prompt_files([self.voices])]
+        audios = [
+            d
+            for d, _ in audio_stems_without_prompt(
+                list_voice_files([self.voices]), list_prompt_files([self.voices])
+            )
+        ]
+
+        def stems(names):
+            return {os.path.splitext(name)[0] for name in names}
+
+        self.assertEqual(stems(prompts) & stems(audios), set())
+
+    def test_recursive_still_applies_to_prompts(self):
+        nested = os.path.join(self.voices, "batch1")
+        os.makedirs(nested)
+        open(os.path.join(nested, "deep.qvp"), "w").close()
+        displays = [d for d, _ in list_prompt_files([self.voices])]
+        self.assertIn("voices/batch1/deep.qvp", displays)
+
+    def test_missing_dir_is_ignored(self):
+        self.assertEqual(list_prompt_files([os.path.join(self.root, "nope")]), [])
 
 
 class ListVoiceFilesTests(unittest.TestCase):
@@ -307,6 +382,120 @@ class MetadataPathTests(unittest.TestCase):
 
         self.assertEqual(meta["relative_path"], "hero.wav")
         self.assertEqual(meta["ref_text"], "hi")
+
+
+class DetectSourceKindTests(unittest.TestCase):
+    def test_qvp_is_a_prompt(self):
+        self.assertEqual(detect_source_kind("voices/柳如烟.qvp"), SOURCE_PROMPT)
+
+    def test_qvp_extension_is_case_insensitive(self):
+        self.assertEqual(detect_source_kind("voices/A.QVP"), SOURCE_PROMPT)
+
+    def test_audio_extensions(self):
+        for name in ("a.wav", "a.mp3", "a.flac", "a.ogg", "a.m4a"):
+            self.assertEqual(detect_source_kind(name), SOURCE_AUDIO, name)
+
+    def test_no_extension_is_a_stem(self):
+        self.assertEqual(detect_source_kind("my_voice"), SOURCE_STEM)
+        self.assertEqual(detect_source_kind(""), SOURCE_STEM)
+
+    def test_prompt_extensions_exported(self):
+        self.assertEqual(PROMPT_EXTENSIONS, (".qvp",))
+
+
+class ResolveVoiceSourceTests(unittest.TestCase):
+    """A `.qvp` path must load the prompt, never silently fall back to audio."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.models = os.path.join(self.root, "models")
+        self.voices = os.path.join(self.models, "qwen-tts", "voices")
+        os.makedirs(self.voices)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _touch(self, name):
+        path = os.path.join(self.voices, name)
+        open(path, "w").close()
+        return path
+
+    def _json(self, stem, payload):
+        import json
+
+        with open(os.path.join(self.voices, stem + ".json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def test_qvp_absolute_path_is_a_prompt(self):
+        qvp = self._touch("hero.qvp")
+        voice = resolve_voice_source(qvp, [self.voices], self.models)
+        self.assertEqual(voice.path, os.path.abspath(qvp))
+        self.assertEqual(voice.kind, SOURCE_PROMPT)
+        self.assertTrue(voice.is_prompt)
+        self.assertFalse(voice.is_audio)
+
+    def test_wav_absolute_path_is_audio(self):
+        wav = self._touch("hero.wav")
+        voice = resolve_voice_source(wav, [self.voices], self.models)
+        self.assertEqual(voice.kind, SOURCE_AUDIO)
+        self.assertTrue(voice.is_audio)
+
+    def test_bare_stem_prefers_qvp_over_audio(self):
+        wav = self._touch("hero.wav")
+        qvp = self._touch("hero.qvp")
+        voice = resolve_voice_source("hero", [self.voices], self.models)
+        self.assertEqual(voice.path, os.path.abspath(qvp))
+        self.assertNotEqual(voice.path, os.path.abspath(wav))
+
+    def test_bare_stem_falls_back_to_audio(self):
+        wav = self._touch("hero.wav")
+        voice = resolve_voice_source("hero", [self.voices], self.models)
+        self.assertEqual(voice.path, os.path.abspath(wav))
+        self.assertEqual(voice.kind, SOURCE_AUDIO)
+
+    def test_qvp_ref_text_comes_from_sidecar_json(self):
+        qvp = self._touch("hero.qvp")
+        self._json("hero", {"ref_text": "参考文本"})
+        voice = resolve_voice_source(qvp, [self.voices], self.models)
+        self.assertEqual(voice.ref_text, "参考文本")
+
+    def test_dropdown_label_form_resolves_qvp(self):
+        self._touch("hero.qvp")
+        voice = resolve_voice_source("voices/hero.qvp", [self.voices], self.models)
+        self.assertEqual(voice.kind, SOURCE_PROMPT)
+
+    def test_missing_stem_lists_extensions(self):
+        with self.assertRaises(FileNotFoundError) as ctx:
+            resolve_voice_source("ghost", [self.voices], self.models)
+        self.assertIn(".qvp", str(ctx.exception))
+        self.assertIn(".wav", str(ctx.exception))
+
+    def test_missing_path_lists_directories(self):
+        with self.assertRaises(FileNotFoundError) as ctx:
+            resolve_voice_source("voices/ghost.qvp", [self.voices], self.models)
+        self.assertIn(self.voices, str(ctx.exception))
+
+    def test_empty_input_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            resolve_voice_source("   ", [self.voices], self.models)
+
+    def test_quotes_and_whitespace_are_stripped(self):
+        qvp = self._touch("hero.qvp")
+        voice = resolve_voice_source(f'  "{qvp}"  ', [self.voices], self.models)
+        self.assertEqual(voice.path, os.path.abspath(qvp))
+
+    def test_stem_without_models_dir_still_matches_directory(self):
+        qvp = self._touch("hero.qvp")
+        voice = resolve_voice_source("hero", [self.voices])
+        self.assertEqual(voice.kind, SOURCE_PROMPT)
+        self.assertEqual(voice.path, os.path.abspath(qvp))
+
+    def test_describe_source_names_the_kind(self):
+        qvp = self._touch("hero.qvp")
+        wav = self._touch("other.wav")
+        self.assertIn("saved prompt", describe_source(resolve_voice_source(qvp, [], "")))
+        self.assertIn("reference audio", describe_source(resolve_voice_source(wav, [], "")))
 
 
 class SubfolderTests(unittest.TestCase):

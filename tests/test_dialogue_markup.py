@@ -34,7 +34,11 @@ def _load_nodes_helpers():
     """
     source = (ROOT / "nodes.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"expand_dialogue_line", "split_text_by_pauses", "unpack_role"}
+    wanted = {
+        "expand_dialogue_line", "split_text_by_pauses", "unpack_role", "role_voice_path",
+        "unpack_qvp", "prompt_embedded_ref_text", "prompt_embedded_instruct",
+        "merge_instruct",
+    }
     picked = [
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted
@@ -54,6 +58,11 @@ def _load_nodes_helpers():
 _helpers = _load_nodes_helpers()
 expand_dialogue_line = _helpers["expand_dialogue_line"]
 unpack_role = _helpers["unpack_role"]
+role_voice_path = _helpers["role_voice_path"]
+unpack_qvp = _helpers["unpack_qvp"]
+prompt_embedded_ref_text = _helpers["prompt_embedded_ref_text"]
+prompt_embedded_instruct = _helpers["prompt_embedded_instruct"]
+merge_instruct = _helpers["merge_instruct"]
 
 NO_PAUSES = {
     "pause_linebreak": 0.0, "period_pause": 0.0, "comma_pause": 0.0,
@@ -353,6 +362,155 @@ class UnpackRoleTests(unittest.TestCase):
         self.assertEqual(card, "")
 
     OLD = "四十岁男性，低音区"
+
+
+class RoleVoicePathTests(unittest.TestCase):
+    """A per-role path is carried alongside the prompt, not inside it."""
+
+    def test_wrapper_with_path(self):
+        entry = {"prompt": None, "instruct": "声线卡", "voice_path": "voices/柳如烟.qvp"}
+        self.assertEqual(role_voice_path(entry), "voices/柳如烟.qvp")
+
+    def test_path_only_role_still_unpacks_to_none_prompt(self):
+        # RoleBankNode writes {"prompt": None, ...} for a path-only role; the
+        # prompt must stay None so DialogueInference can swap in the resolved
+        # one from the path.
+        entry = {"prompt": None, "instruct": "", "voice_path": "a.qvp"}
+        prompt, card = unpack_role(entry)
+        self.assertIsNone(prompt)
+        self.assertEqual(card, "")
+
+    def test_path_is_stripped(self):
+        self.assertEqual(role_voice_path({"voice_path": "  a.qvp  "}), "a.qvp")
+
+    def test_missing_path_is_empty(self):
+        self.assertEqual(role_voice_path({"prompt": "P", "instruct": ""}), "")
+        self.assertEqual(role_voice_path("bare prompt"), "")
+        self.assertEqual(role_voice_path(["item"]), "")
+
+    def test_non_string_path_is_empty(self):
+        self.assertEqual(role_voice_path({"voice_path": None}), "")
+        self.assertEqual(role_voice_path({"voice_path": 123}), "")
+
+    def test_path_does_not_change_the_card(self):
+        entry = {"prompt": "P", "instruct": "卡片", "voice_path": "b.wav"}
+        self.assertEqual(unpack_role(entry), ("P", "卡片"))
+
+
+class PromptItem:
+    """Stand-in for VoiceClonePromptItem (only the fields we read)."""
+
+    def __init__(self, ref_text=None):
+        self.ref_text = ref_text
+
+
+class QvpPackagingTests(unittest.TestCase):
+    """A .qvp carries its own ref_text and instruct; both outrank the sidecar."""
+
+    def test_legacy_bare_prompt_has_no_text(self):
+        bundle = unpack_qvp([PromptItem(None)])
+        self.assertEqual(bundle["ref_text"], "")
+        self.assertEqual(bundle["instruct"], "")
+
+    def test_legacy_bare_prompt_is_kept_as_prompt(self):
+        items = [PromptItem("x")]
+        self.assertIs(unpack_qvp(items)["prompt"], items)
+
+    def test_packaged_dict_is_split(self):
+        bundle = unpack_qvp({
+            "prompt": ["p"], "ref_text": "转写", "instruct": "中高音区",
+            "source": "SaveVoiceNode", "version": "1.2",
+        })
+        self.assertEqual(bundle["prompt"], ["p"])
+        self.assertEqual(bundle["ref_text"], "转写")
+        self.assertEqual(bundle["instruct"], "中高音区")
+
+    def test_non_string_fields_are_ignored(self):
+        bundle = unpack_qvp({"prompt": "p", "ref_text": None, "instruct": 42})
+        self.assertEqual(bundle["ref_text"], "")
+        self.assertEqual(bundle["instruct"], "")
+
+    def test_embedded_ref_text_read_from_items(self):
+        self.assertEqual(prompt_embedded_ref_text([PromptItem("参考文本")]), "参考文本")
+
+    def test_embedded_ref_text_skips_blank(self):
+        self.assertEqual(prompt_embedded_ref_text([PromptItem("   ")]), "")
+        self.assertEqual(prompt_embedded_ref_text([PromptItem(None)]), "")
+
+    def test_embedded_ref_text_ignores_ambiguous_batch(self):
+        # Several different transcripts cannot be represented by one string.
+        items = [PromptItem("A"), PromptItem("B")]
+        self.assertEqual(prompt_embedded_ref_text(items), "")
+
+    def test_embedded_ref_text_accepts_matching_batch(self):
+        items = [PromptItem("A"), PromptItem("A")]
+        self.assertEqual(prompt_embedded_ref_text(items), "A")
+
+    def test_embedded_ref_text_handles_packaged_dict(self):
+        self.assertEqual(
+            prompt_embedded_ref_text({"prompt": [PromptItem("A")]}), "A"
+        )
+
+    def test_embedded_ref_text_handles_single_item(self):
+        self.assertEqual(prompt_embedded_ref_text(PromptItem("A")), "A")
+
+    def test_embedded_ref_text_missing_attribute_is_empty(self):
+        self.assertEqual(prompt_embedded_ref_text("not-an-item"), "")
+
+    def test_embedded_instruct_only_from_package(self):
+        self.assertEqual(prompt_embedded_instruct({"instruct": " 低音区 "}), "低音区")
+        self.assertEqual(prompt_embedded_instruct([PromptItem("A")]), "")
+        self.assertEqual(prompt_embedded_instruct({"instruct": None}), "")
+
+    def test_saved_text_prefers_embedded_over_typed(self):
+        # Mirrors SaveVoiceNode.save: embedded wins, typed only fills a gap.
+        def saved_text(prompt, typed):
+            return prompt_embedded_ref_text(prompt) or (typed.strip() if typed else "")
+
+        embedded = [PromptItem("prompt 自带的转写")]
+        self.assertEqual(saved_text(embedded, "手填的转写"), "prompt 自带的转写")
+        self.assertEqual(saved_text(embedded, ""), "prompt 自带的转写")
+        self.assertEqual(saved_text([PromptItem(None)], "手填的转写"), "手填的转写")
+        self.assertEqual(saved_text([PromptItem(None)], ""), "")
+
+
+class MergeInstructTests(unittest.TestCase):
+    """A saved voice card and a typed instruct are concatenated, card first."""
+
+    def test_card_only(self):
+        self.assertEqual(merge_instruct("", "中高音区"), "中高音区")
+
+    def test_typed_only(self):
+        self.assertEqual(merge_instruct("语速偏快", ""), "语速偏快")
+
+    def test_both_are_kept_with_card_first(self):
+        merged = merge_instruct("这一句要压低声音", "中高音区，音色清亮")
+        self.assertEqual(merged, "中高音区，音色清亮，这一句要压低声音")
+
+    def test_identical_values_are_not_duplicated(self):
+        self.assertEqual(merge_instruct("中高音区", "中高音区"), "中高音区")
+
+    def test_typed_already_contains_card_is_kept_as_is(self):
+        # Re-typing the card's wording must not produce "卡，卡，补充".
+        self.assertEqual(
+            merge_instruct("中高音区，语速偏快", "中高音区"), "中高音区，语速偏快"
+        )
+
+    def test_card_already_contains_typed_is_kept_as_is(self):
+        self.assertEqual(
+            merge_instruct("语速偏快", "中高音区，语速偏快"), "中高音区，语速偏快"
+        )
+
+    def test_whitespace_is_ignored(self):
+        self.assertEqual(merge_instruct("   ", "  中高音区  "), "中高音区")
+
+    def test_both_empty(self):
+        self.assertEqual(merge_instruct("", ""), "")
+
+    def test_joined_with_fullwidth_comma(self):
+        # build_emotion_instruct joins its parts with "，"; matching that keeps
+        # the merged string reading as one instruction.
+        self.assertIn("，", merge_instruct("A", "B"))
 
 
 if __name__ == "__main__":

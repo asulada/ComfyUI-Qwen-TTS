@@ -16,12 +16,21 @@ unit-testable without the ComfyUI runtime.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
 VOICES_SUBDIR = "voices"
 VOICE_DIRS_ENV = "QWEN_TTS_VOICE_DIRS"
 
 AUDIO_EXTENSIONS = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
+
+# ``.qvp`` is the saved voice-clone prompt (``torch.save`` of the prompt
+# items).  It is not playable audio, but it *is* a first-class way to name a
+# voice: loading it skips re-encoding the reference audio and reproduces the
+# exact timbre that was saved.
+PROMPT_EXTENSIONS = (".qvp",)
+
+VOICE_EXTENSIONS = AUDIO_EXTENSIONS + PROMPT_EXTENSIONS
 
 # Display names are "<label>/<filename>"; this label is used for the
 # traditional single-directory location.
@@ -97,12 +106,20 @@ def dir_label(path: str, models_dir: str) -> str:
     return name
 
 
-def list_voice_files(directories: Iterable[str], recursive: bool = True) -> List[Tuple[str, str]]:
-    """Return ``(display_name, absolute_path)`` for every audio file found.
+def list_voice_files(
+    directories: Iterable[str],
+    recursive: bool = True,
+    extensions: Tuple[str, ...] = AUDIO_EXTENSIONS,
+) -> List[Tuple[str, str]]:
+    """Return ``(display_name, absolute_path)`` for every matching file found.
 
     ``display_name`` is ``"<label>/<relative/path/file.wav>"``.  Sub-directories
     created through SaveVoice's ``subfolder`` are included when ``recursive`` is
     true, so they show up in the dropdown instead of becoming unreachable.
+
+    ``extensions`` defaults to audio, which keeps every existing caller
+    unchanged.  Pass ``PROMPT_EXTENSIONS`` (via ``list_prompt_files``) to build
+    a dropdown of saved prompts instead.
     """
     dirs = [d for d in directories if d and os.path.isdir(d)]
     if not dirs:
@@ -133,7 +150,7 @@ def list_voice_files(directories: Iterable[str], recursive: bool = True) -> List
 
         for root, names in walker:
             for name in sorted(names):
-                if not name.lower().endswith(AUDIO_EXTENSIONS):
+                if not name.lower().endswith(tuple(extensions)):
                     continue
                 full = os.path.join(root, name)
                 if not os.path.isfile(full):
@@ -147,6 +164,43 @@ def list_voice_files(directories: Iterable[str], recursive: bool = True) -> List
 
     entries.sort(key=lambda item: item[0].lower())
     return entries
+
+
+def list_prompt_files(
+    directories: Iterable[str],
+    recursive: bool = True,
+) -> List[Tuple[str, str]]:
+    """``(display_name, absolute_path)`` for every saved prompt (``.qvp``).
+
+    Kept separate from ``list_voice_files`` so the audio dropdown stays exactly
+    as it was.  A ``.qvp`` carries the prompt itself, so it is the more precise
+    of the two choices; the UI lists it first for that reason.
+    """
+    return list_voice_files(directories, recursive=recursive, extensions=PROMPT_EXTENSIONS)
+
+
+def audio_stems_without_prompt(
+    audio_entries: Iterable[Tuple[str, str]],
+    prompt_entries: Iterable[Tuple[str, str]],
+) -> List[Tuple[str, str]]:
+    """Audio entries that have no same-stem ``.qvp`` among ``prompt_entries``.
+
+    Both lists are needed because the audio scan only sees audio: it cannot
+    know a prompt exists unless the prompt scan is passed in.  Offering both
+    ``voices/hero.qvp`` and ``voices/hero.wav`` would make the user guess which
+    one wins, when the answer is always the prompt.
+    """
+    stems_with_prompt = {
+        _norm(os.path.splitext(path)[0]) for _display, path in prompt_entries
+    }
+    if not stems_with_prompt:
+        return list(audio_entries)
+
+    return [
+        (display, path)
+        for display, path in audio_entries
+        if _norm(os.path.splitext(path)[0]) not in stems_with_prompt
+    ]
 
 
 def split_display_name(display: str) -> Tuple[Optional[str], str]:
@@ -350,3 +404,159 @@ def sibling_metadata_paths(audio_path: str) -> Dict[str, str]:
         "qvp": stem + ".qvp",
         "json": stem + ".json",
     }
+
+
+# ---------------------------------------------------------------------------
+# Voice sources
+#
+# A voice can be named three ways, and the order matters:
+#
+#   "prompt" -> a saved ``.qvp``        (exact, no re-encoding)
+#   "audio"  -> a ``.wav``/``.mp3``/...  (needs a prompt build)
+#   "stem"   -> a bare name with no extension; resolved against the library
+#
+# ``.qvp`` wins whenever it is what the user actually pointed at, and an
+# audio file next to a ``.qvp`` is *not* silently swapped in: dropping the
+# saved prompt would change the timbre the user picked.
+# ---------------------------------------------------------------------------
+
+SOURCE_PROMPT = "prompt"
+SOURCE_AUDIO = "audio"
+SOURCE_STEM = "stem"
+
+
+@dataclass(frozen=True)
+class VoiceSource:
+    """What a path input resolved to.
+
+    ``path`` is the absolute file that will be loaded.  ``payload`` is
+    ``.qvp`` (the file *is* the prompt), ``audio`` (a waveform that still needs
+    ``create_voice_clone_prompt``), or ``stem`` (nothing exists yet — the
+    caller must look for ``<stem>.qvp`` / ``<stem>.wav`` itself).
+    ``ref_text`` and ``instruct`` come from the sidecar JSON when one exists.
+    They are only fallbacks: a ``.qvp`` carries its own copies, and those
+    describe what was actually saved.
+    """
+
+    path: str
+    kind: str
+    ref_text: str = ""
+    instruct: str = ""
+
+    @property
+    def is_prompt(self) -> bool:
+        return self.kind == SOURCE_PROMPT
+
+    @property
+    def is_audio(self) -> bool:
+        return self.kind == SOURCE_AUDIO
+
+    @property
+    def has_file(self) -> bool:
+        return self.kind in (SOURCE_PROMPT, SOURCE_AUDIO)
+
+
+def detect_source_kind(path: str) -> str:
+    """Classify a voice path by extension.
+
+    Returns ``SOURCE_PROMPT`` for ``.qvp``, ``SOURCE_AUDIO`` for anything in
+    ``AUDIO_EXTENSIONS``, and ``SOURCE_STEM`` otherwise (including no
+    extension at all).
+    """
+    ext = os.path.splitext(path or "")[1].lower()
+    if ext in PROMPT_EXTENSIONS:
+        return SOURCE_PROMPT
+    if ext in AUDIO_EXTENSIONS:
+        return SOURCE_AUDIO
+    return SOURCE_STEM
+
+
+def describe_source(voice: VoiceSource) -> str:
+    """Short human label for logs: ``"prompt <path>"`` / ``"audio <path>"``."""
+    if voice.kind == SOURCE_PROMPT:
+        return f"saved prompt {voice.path}"
+    if voice.kind == SOURCE_AUDIO:
+        return f"reference audio {voice.path}"
+    return f"voice name {voice.path}"
+
+
+def _read_sidecar(path: str) -> Tuple[str, str]:
+    """``(ref_text, instruct)`` from the sidecar JSON; empty strings if absent."""
+    metadata = read_voice_metadata(path)
+    ref_text = metadata.get("ref_text", "")
+    instruct = metadata.get("instruct", "")
+    return (
+        ref_text if isinstance(ref_text, str) else "",
+        instruct if isinstance(instruct, str) else "",
+    )
+
+
+def _source(path: str) -> "VoiceSource":
+    """Build a ``VoiceSource`` for ``path``, filling in sidecar values."""
+    ref_text, instruct = _read_sidecar(path)
+    return VoiceSource(path, detect_source_kind(path), ref_text, instruct)
+
+
+def resolve_voice_source(
+    path_or_name: str,
+    directories: Iterable[str] = (),
+    models_dir: str = "",
+) -> VoiceSource:
+    """Resolve a path input to a concrete ``VoiceSource``.
+
+    Accepted, in this order:
+
+    1. an existing file (absolute, or relative to the current directory) —
+       ``.qvp`` -> prompt, audio extension -> audio;
+    2. a bare name without an extension (``my_voice``) — ``my_voice.qvp``
+       preferred over ``my_voice.wav`` in the scanned directories;
+    3. the dropdown form ``"<label>/<file>"`` and plain relative paths,
+       matched against ``directories``.
+
+    Raises ``FileNotFoundError`` with the scanned directories listed, so a
+    typo points at what was actually searched instead of failing deeper in
+    the model with an obscure tokenizer error.
+    """
+    text = (path_or_name or "").strip().strip('"')
+    if not text:
+        raise ValueError("No voice file specified")
+
+    # 1. A real file, given absolutely or relative to the process cwd.
+    if os.path.isfile(text):
+        absolute = os.path.abspath(text)
+        return _source(absolute)
+
+    dirs = [d for d in directories if d and os.path.isdir(d)]
+
+    # 2. A bare name: try the library directories with the known extensions.
+    kind = detect_source_kind(text)
+    if kind == SOURCE_STEM and "/" not in text.replace("\\", "/"):
+        for extension in PROMPT_EXTENSIONS + AUDIO_EXTENSIONS:
+            candidate = text + extension
+            for directory in dirs:
+                full = os.path.join(directory, candidate)
+                if os.path.isfile(full):
+                    full = os.path.abspath(full)
+                    return _source(full)
+        raise FileNotFoundError(
+            f"Voice not found: {text!r}. Looked for {', '.join(PROMPT_EXTENSIONS + AUDIO_EXTENSIONS)}. "
+            f"Scanned directories: {', '.join(dirs) or '(none)'}"
+        )
+
+    # 3. Dropdown form / relative path against the scanned directories.
+    if models_dir:
+        try:
+            resolved = resolve_input_path(text, dirs, models_dir)
+            return _source(resolved)
+        except FileNotFoundError:
+            pass
+    else:
+        for directory in dirs:
+            candidate = os.path.join(directory, *[p for p in text.replace("\\", "/").split("/") if p not in ("", ".")])
+            if os.path.isfile(candidate):
+                candidate = os.path.abspath(candidate)
+                return _source(candidate)
+
+    raise FileNotFoundError(
+        f"Voice not found: {text!r}. Scanned directories: {', '.join(dirs) or '(none)'}"
+    )

@@ -15,13 +15,19 @@ from comfy.utils import ProgressBar
 
 from .pause_utils import extract_leading_pause
 from .voice_store import (
+    SOURCE_STEM,
+    VoiceSource,
+    audio_stems_without_prompt,
     collect_voice_dirs,
+    detect_source_kind,
+    describe_source,
+    list_prompt_files,
     list_voice_files,
     build_filename_choices,
     relative_voice_path,
     resolve_bare_name,
-    resolve_input_path,
     resolve_output_dir,
+    resolve_voice_source,
     sibling_metadata_paths,
 )
 from .emotion_utils import (
@@ -61,6 +67,215 @@ def get_voice_search_dirs(extra_dir: str = "") -> List[str]:
         if os.path.isdir(target) and target not in dirs:
             dirs.append(target)
     return dirs
+
+
+# ===== Reference voices given as a path =====
+#
+# A path input accepts both a saved prompt (``.qvp``) and a reference audio
+# file.  ``.qvp`` is preferred whenever it is what the user pointed at: it
+# carries the exact ref_code / speaker embedding that was saved, so no
+# re-encoding happens and the timbre cannot drift.
+
+def read_qvp(qvp_path: str) -> Any:
+    """Load a ``.qvp`` with the PyTorch 2.6+ safety switch handled.
+
+    Returns whatever was serialised: either a bare prompt (legacy, written by
+    older ``SaveVoice``) or a package dict ``{"prompt", "ref_text", "instruct"}``.
+    """
+    if hasattr(torch, "serialization") and hasattr(torch.serialization, "add_safe_globals"):
+        return torch.load(qvp_path, map_location="cpu", weights_only=False)
+    return torch.load(qvp_path, map_location="cpu")
+
+
+def unpack_qvp(data: Any) -> Dict[str, Any]:
+    """Normalise a loaded ``.qvp`` into ``{"prompt", "ref_text", "instruct"}``.
+
+    Legacy files are a bare prompt with no text, so ``ref_text`` and
+    ``instruct`` come back empty and callers fall back to the sidecar JSON.
+    """
+    if isinstance(data, dict) and "prompt" in data:
+        ref_text = data.get("ref_text", "") or ""
+        instruct = data.get("instruct", "") or ""
+        return {
+            "prompt": data["prompt"],
+            "ref_text": ref_text if isinstance(ref_text, str) else "",
+            "instruct": instruct if isinstance(instruct, str) else "",
+        }
+    return {"prompt": data, "ref_text": "", "instruct": ""}
+
+
+def load_qvp_bundle(qvp_path: str) -> Dict[str, Any]:
+    """``read_qvp`` + ``unpack_qvp``."""
+    return unpack_qvp(read_qvp(qvp_path))
+
+
+def load_qvp_prompt(qvp_path: str) -> Tuple[Any, str]:
+    """Read a ``.qvp`` file into ``(prompt_items, ref_text)``.
+
+    Handles both the legacy packaged dict (``{"prompt": ..., "ref_text": ...}``)
+    and the raw prompt that older ``SaveVoiceNode`` versions wrote.
+    """
+    bundle = load_qvp_bundle(qvp_path)
+    return bundle["prompt"], bundle["ref_text"]
+
+
+def prompt_embedded_ref_text(prompt: Any) -> str:
+    """The ``ref_text`` stored *inside* a prompt, or ``""`` when there is none.
+
+    ``create_voice_clone_prompt`` returns ``VoiceClonePromptItem``s that each
+    carry the transcript they were built with.  That value is what the model
+    actually conditioned on, so it outranks anything typed into a node later.
+    """
+    items = prompt
+    if isinstance(items, dict) and "prompt" in items:
+        items = items["prompt"]
+    if not isinstance(items, (list, tuple)):
+        items = [items]
+
+    texts = set()
+    for item in items:
+        text = getattr(item, "ref_text", None)
+        if isinstance(text, str) and text.strip():
+            texts.add(text.strip())
+    # Ambiguous batches (several different transcripts) cannot be represented
+    # by one saved string, so report nothing instead of picking arbitrarily.
+    return texts.pop() if len(texts) == 1 else ""
+
+
+def prompt_embedded_instruct(prompt: Any) -> str:
+    """The ``instruct`` packed into a ``.qvp`` package, or ``""``."""
+    if isinstance(prompt, dict):
+        value = prompt.get("instruct", "")
+        if isinstance(value, str):
+            return value.strip()
+    return ""
+
+
+# A saved voice card and a hand-typed instruct describe the same thing (pitch,
+# timbre, rate) from two eras, so they are concatenated rather than one
+# replacing the other: dropping either silently changes how every line sounds.
+# The card goes first because it is the voice's baseline; the typed text is
+# this run's refinement and lands last, where the model weighs it more.
+
+
+def merge_instruct(typed: str, voice_card: str) -> str:
+    """Join a typed ``instruct`` with a saved voice card.
+
+    Duplicates are collapsed, since re-typing the card's own wording is the
+    most likely way the two values overlap ("中高音区" in both would otherwise
+    read as "中高音区，中高音区").
+
+    The separator is the full-width comma that ``build_emotion_instruct`` also
+    uses, so the merged string reads as one instruction.  It is a literal here
+    rather than a module constant so this function stays extractable on its own
+    (tests pull it out of ``nodes.py`` without importing torch).
+    """
+    card = (voice_card or "").strip()
+    text = (typed or "").strip()
+
+    if not card:
+        return text
+    if not text:
+        return card
+    if text == card:
+        return card
+    if card in text:
+        return text
+    if text in card:
+        return card
+    return f"{card}，{text}"
+
+
+def load_audio_pair(path: str) -> "Tuple[np.ndarray, int]":
+    """Decode a reference audio file into ``(waveform, sample_rate)``."""
+    import librosa
+
+    wav, sr = librosa.load(path, sr=None)
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.ndim > 1:
+        wav = np.mean(wav, axis=-1).astype(np.float32)
+    return wav, int(sr)
+
+
+def load_voice_card(path_or_name: str, extra_dir: str = "") -> str:
+    """The saved voice card for a path, without decoding audio or loading a model.
+
+    ``load_ref_voice`` would also decode the reference audio, which is wasted
+    work when only the card is needed before the model exists (EmotionalTTS
+    merges it into every plan up front).
+    """
+    search_dirs = get_voice_search_dirs(extra_dir)
+    try:
+        voice = resolve_voice_source(path_or_name, search_dirs, folder_paths.models_dir)
+    except FileNotFoundError as e:
+        raise RuntimeError(str(e))
+
+    if voice.is_prompt:
+        try:
+            embedded = load_qvp_bundle(voice.path)["instruct"]
+        except Exception as e:
+            print(f"⚠️ [Qwen3-TTS] Could not read the voice card from {voice.path}: {e}")
+            embedded = ""
+        return embedded or voice.instruct
+    return voice.instruct
+
+
+def load_ref_voice(
+    path_or_name: str,
+    extra_dir: str = "",
+) -> "Tuple[Optional[Any], Optional[Tuple[np.ndarray, int]], str, str]":
+    """Resolve a path input into ``(prompt, audio_pair, ref_text, instruct)``.
+
+    For a ``.qvp``, ``ref_text`` and ``instruct`` come from the file itself,
+    falling back to the sidecar JSON — the prompt's own values describe what
+    was saved, while a sidecar value may have been typed in later.  For audio,
+    only the sidecar can supply them.
+    """
+    search_dirs = get_voice_search_dirs(extra_dir)
+    try:
+        voice: VoiceSource = resolve_voice_source(
+            path_or_name, search_dirs, folder_paths.models_dir
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(str(e))
+
+    print(f"🎙️ [Qwen3-TTS] Voice path resolved to {describe_source(voice)}")
+
+    if voice.is_prompt:
+        bundle = load_qvp_bundle(voice.path)
+        instruct = bundle["instruct"] or voice.instruct
+        return bundle["prompt"], None, bundle["ref_text"] or voice.ref_text, instruct
+
+    return None, load_audio_pair(voice.path), voice.ref_text, voice.instruct
+
+
+def prompt_from_audio_or_warn(
+    model: Any,
+    audio_pair: "Tuple[np.ndarray, int]",
+    ref_text: str,
+    node_name: str,
+) -> Any:
+    """Build a clone prompt from reference audio, tolerating a missing ref_text.
+
+    ICL mode (``x_vector_only_mode=False``) needs the transcript; a bare path
+    input has nowhere to put one.  Rather than failing with the upstream
+    ``ref_text is required`` error, fall back to speaker-embedding-only mode
+    and say so once — the caller should point at a ``.qvp`` (which stores the
+    transcript) when ICL quality matters.
+    """
+    if ref_text and ref_text.strip():
+        return model.create_voice_clone_prompt(
+            ref_audio=audio_pair, ref_text=ref_text, x_vector_only_mode=False
+        )
+
+    print(
+        f"⚠️ [Qwen3-TTS] {node_name}: reference audio has no 'ref_text' "
+        "(no sidecar JSON), using speaker-embedding-only mode. Point at the "
+        "saved .qvp instead to keep ICL quality."
+    )
+    return model.create_voice_clone_prompt(
+        ref_audio=audio_pair, ref_text=None, x_vector_only_mode=True
+    )
 
 # ===== XPU 稳定性补丁：修复 level_zero 设备丢失 =====
 import transformers.pytorch_utils
@@ -913,6 +1128,13 @@ class VoiceCloneNode:
             },
             "optional": {
                 "ref_audio": ("AUDIO", {"tooltip": "Reference audio (ComfyUI Audio)"}),
+                "ref_voice_path": ("STRING", {
+                    "default": "",
+                    "placeholder": "Path to a saved .qvp, or a reference audio file",
+                    "tooltip": "Takes priority over ref_audio / voice_clone_prompt. A .qvp is used as-is "
+                               "(exact saved timbre, no re-encoding); audio is encoded into a prompt. "
+                               "Relative paths and bare names resolve against the scanned voice directories.",
+                }),
                 "ref_text": ("STRING", {"multiline": True, "default": "", "placeholder": "Reference audio text (optional)"}),
                 "voice_clone_prompt": ("VOICE_CLONE_PROMPT", {"tooltip": "Reusable voice clone prompt from VoiceClonePromptNode"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
@@ -1026,11 +1248,23 @@ class VoiceCloneNode:
                  x_vector_only: bool = False, attention: str = "auto",
                  instruct: str = "",
                  unload_model_after_generate: bool = False, custom_model_path: str = "",
-                 speed: float = 1.0) -> Tuple[Dict[str, Any]]:
-        if ref_audio is None and voice_clone_prompt is None:
-            raise RuntimeError("Either reference audio or voice clone prompt is required")
+                 speed: float = 1.0, ref_voice_path: str = "") -> Tuple[Dict[str, Any]]:
+        # A path input is an explicit, per-run choice: it wins over the wired
+        # inputs, and the log says what was ignored so a stale workflow is
+        # visible instead of silently producing the wrong voice.
+        path_voice = (ref_voice_path or "").strip()
+        if not path_voice and ref_audio is None and voice_clone_prompt is None:
+            raise RuntimeError("Either reference audio, voice clone prompt, or ref_voice_path is required")
 
-        warn_on_missing_instruct(instruct, voice_clone_prompt is not None, "VoiceClone")
+        if path_voice and (ref_audio is not None or voice_clone_prompt is not None):
+            print(
+                "ℹ️ [Qwen3-TTS] VoiceClone: 'ref_voice_path' is set, ignoring the connected "
+                "'ref_audio' / 'voice_clone_prompt'."
+            )
+
+        warn_on_missing_instruct(
+            instruct, voice_clone_prompt is not None or bool(path_voice), "VoiceClone"
+        )
 
         pbar = ProgressBar(3)
 
@@ -1059,12 +1293,30 @@ class VoiceCloneNode:
             else:
                 raise RuntimeError("Unsupported reference audio format")
 
+        # Resolve the path input into a prompt once, before generating: a
+        # ".qvp" is already a prompt, audio has to be encoded.
+        path_prompt = None
+        if path_voice:
+            path_prompt, path_audio, path_ref_text, path_instruct = load_ref_voice(path_voice)
+            # The card saved with the .qvp restores the pitch/rate the voice
+            # was created with; text typed on this node is appended, not
+            # substituted, so neither description is lost.
+            if path_instruct:
+                instruct = merge_instruct(instruct, path_instruct)
+                print(f"🎭 [Qwen3-TTS] VoiceClone: merged the voice card stored in the .qvp: {path_instruct}")
+            if path_prompt is None:
+                path_prompt = prompt_from_audio_or_warn(
+                    model, path_audio, ref_text or path_ref_text, "VoiceClone"
+                )
+
         try:
             mapped_lang = LANGUAGE_MAP.get(language, "auto")
 
             voice_clone_prompt_param = None
             ref_audio_param = None
-            if voice_clone_prompt is not None:
+            if path_prompt is not None:
+                voice_clone_prompt_param = path_prompt
+            elif voice_clone_prompt is not None:
                 voice_clone_prompt_param = voice_clone_prompt
             elif ref_audio is not None:
                 ref_audio_param = audio_tuple
@@ -1244,6 +1496,13 @@ class EmotionalTTSNode:
             },
             "optional": {
                 "voice_clone_prompt": ("VOICE_CLONE_PROMPT", {"tooltip": "Reference timbre from VoiceClonePromptNode / LoadSpeakerNode. Switches to the Base model and overrides speaker."}),
+                "ref_voice_path": ("STRING", {
+                    "default": "",
+                    "placeholder": "Path to a saved .qvp, or a reference audio file",
+                    "tooltip": "Takes priority over voice_clone_prompt and switches to the Base model, like a "
+                               "connected prompt. A .qvp is used as-is (exact saved timbre); audio is encoded "
+                               "into a prompt. Relative paths and bare names resolve against the voice directories.",
+                }),
                 "instruct": ("STRING", {"multiline": True, "default": "", "placeholder": "Extra style text appended to every segment's preset"}),
                 "linebreak_pause": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 5.0, "step": 0.1, "tooltip": "Silence for each newline in the script"}),
                 "scale_pauses_with_speed": ("BOOLEAN", {"default": False, "tooltip": "Also speed up/slow down inserted silences"}),
@@ -1285,13 +1544,33 @@ class EmotionalTTSNode:
                  top_p: float = 1.0, top_k: int = 50, temperature: float = 0.9,
                  repetition_penalty: float = 1.05, attention: str = "auto",
                  unload_model_after_generate: bool = False, custom_model_path: str = "",
-                 custom_speaker_name: str = "", voice_clone_prompt: Optional[Any] = None) -> Tuple[Dict[str, Any]]:
+                 custom_speaker_name: str = "", voice_clone_prompt: Optional[Any] = None,
+                 ref_voice_path: str = "") -> Tuple[Dict[str, Any]]:
         if not text or not text.strip():
             raise RuntimeError("Text is required")
+
+        # A path input behaves like a connected prompt: it selects the Base
+        # model and replaces `speaker`.  Deciding that before the model is
+        # loaded keeps the CustomVoice/Base choice correct.
+        path_voice = (ref_voice_path or "").strip()
+        if path_voice and voice_clone_prompt is not None:
+            print(
+                "ℹ️ [Qwen3-TTS] EmotionalTTS: 'ref_voice_path' is set, ignoring the "
+                "connected 'voice_clone_prompt'."
+            )
 
         segments = parse_rich_text(text, linebreak_pause)
         if not segments:
             raise RuntimeError("No speakable text found after parsing markup")
+
+        # The .qvp's voice card must be merged BEFORE the plans are built: the
+        # plans bake `instruct` into per-segment text, so merging afterwards
+        # would never reach the model.
+        if path_voice:
+            saved_card = load_voice_card(path_voice)
+            if saved_card:
+                instruct = merge_instruct(instruct, saved_card)
+                print(f"🎭 [Qwen3-TTS] EmotionalTTS: merged the voice card stored in the .qvp: {saved_card}")
 
         plans = build_segment_plans(
             segments,
@@ -1304,39 +1583,39 @@ class EmotionalTTSNode:
         if not plans:
             raise RuntimeError("No speakable text found after parsing markup")
 
-        if not any(plan.instruct.strip() for plan in plans):
-            warn_on_missing_instruct("", voice_clone_prompt is not None, "EmotionalTTS")
+        has_path_voice = bool(path_voice)
 
-        if model_choice == "0.6B" and voice_clone_prompt is None and any(plan.instruct.strip() for plan in plans):
+        if not any(plan.instruct.strip() for plan in plans):
+            warn_on_missing_instruct(
+                "", voice_clone_prompt is not None or has_path_voice, "EmotionalTTS"
+            )
+
+        if model_choice == "0.6B" and voice_clone_prompt is None and not has_path_voice \
+                and any(plan.instruct.strip() for plan in plans):
             raise RuntimeError(
                 "EmotionalTTS needs instruct conditioning to apply emotions, but the 0.6B "
                 "CustomVoice model ignores instruct. Use model_choice='1.7B', or clear the "
                 "emotion preset / extra instruct to run 0.6B without emotion control."
             )
 
-        use_clone = voice_clone_prompt is not None
+        use_clone = voice_clone_prompt is not None or has_path_voice
         if use_clone and model_choice == "0.6B" and any(plan.instruct.strip() for plan in plans):
             print("⚠️ [Qwen3-TTS] EmotionalTTS: 0.6B Base model + emotion instruct is not officially "
                   "documented; 1.7B follows the instruction more reliably.")
 
-        clone_item = None
+        clone_source = None
         if use_clone:
-            if isinstance(voice_clone_prompt, list):
+            if has_path_voice:
+                clone_source = None  # resolved below, once the model exists
+            elif isinstance(voice_clone_prompt, list):
                 if not voice_clone_prompt:
                     raise RuntimeError("voice_clone_prompt is an empty list")
                 if len(voice_clone_prompt) > 1:
                     print(f"⚠️ [Qwen3-TTS] EmotionalTTS uses a single timbre; "
                           f"taking the first of {len(voice_clone_prompt)} prompts.")
-                clone_item = voice_clone_prompt[0]
+                clone_source = voice_clone_prompt[0]
             else:
-                clone_item = voice_clone_prompt
-
-        def clone_arg(count: int):
-            # generate_voice_clone accepts either a single packaged dict or a
-            # list of VoiceClonePromptItem, so keep the dict shape as-is.
-            if isinstance(clone_item, dict):
-                return clone_item
-            return [clone_item] * count
+                clone_source = voice_clone_prompt
 
         model_type = "Base" if use_clone else "CustomVoice"
 
@@ -1362,6 +1641,30 @@ class EmotionalTTSNode:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         np.random.seed(seed % (2**32))
+
+        # Resolve a path input now that the Base model exists (audio has to be
+        # encoded into a prompt; a .qvp needs no model and would be wasted
+        # work earlier).
+        clone_item = clone_source
+        if path_voice:
+            # The card was already merged before the plans were built.
+            path_prompt, path_audio, path_ref_text, _path_instruct = load_ref_voice(path_voice)
+            if isinstance(path_prompt, list):
+                if len(path_prompt) > 1:
+                    print(f"⚠️ [Qwen3-TTS] EmotionalTTS uses a single timbre; "
+                          f"taking the first of {len(path_prompt)} prompts.")
+                clone_item = path_prompt[0] if path_prompt else None
+            else:
+                clone_item = path_prompt
+            if clone_item is None:
+                raise RuntimeError(f"Could not read a voice prompt from {path_voice!r}")
+
+        def clone_arg(count: int):
+            # generate_voice_clone accepts either a single packaged dict or a
+            # list of VoiceClonePromptItem, so keep the dict shape as-is.
+            if isinstance(clone_item, dict):
+                return clone_item
+            return [clone_item] * count
 
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
 
@@ -1440,7 +1743,6 @@ class VoiceClonePromptNode:
     def INPUT_TYPES(cls) -> Dict[str, Any]:
         return {
             "required": {
-                "ref_audio": ("AUDIO", {"tooltip": "Reference audio (ComfyUI Audio)"}),
                 "ref_text": ("STRING", {"multiline": True, "default": "", "placeholder": "Reference audio text (highly recommended for better quality)"}),
                 "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
                 "device": (["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}),
@@ -1448,6 +1750,15 @@ class VoiceClonePromptNode:
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
             },
             "optional": {
+                # Moved out of "required": a path input can replace the wiring,
+                # and requiring both would make the new input unusable.
+                "ref_audio": ("AUDIO", {"tooltip": "Reference audio (ComfyUI Audio). Not needed when ref_voice_path is set."}),
+                "ref_voice_path": ("STRING", {
+                    "default": "",
+                    "placeholder": "Path to a saved .qvp, or a reference audio file",
+                    "tooltip": "Takes priority over ref_audio. Pointing at a .qvp returns the saved prompt "
+                               "directly, without loading a model or re-encoding.",
+                }),
                 "x_vector_only": ("BOOLEAN", {"default": False, "tooltip": "If True, only speaker embedding is extracted (ref_text not needed)"}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
             }
@@ -1459,9 +1770,36 @@ class VoiceClonePromptNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "VoiceClonePrompt: Extract and cache voice features for reuse in VoiceClone node."
 
-    def create_prompt(self, ref_audio: Dict[str, Any], ref_text: str, model_choice: str, device: str, precision: str, attention: str, x_vector_only: bool = False, unload_model_after_generate: bool = False) -> Tuple[Any]:
-        if ref_audio is None:
-            raise RuntimeError("Reference audio is required")
+    def create_prompt(self, ref_text: str, model_choice: str, device: str, precision: str, attention: str,
+                      ref_audio: Optional[Dict[str, Any]] = None,
+                      ref_voice_path: str = "",
+                      x_vector_only: bool = False, unload_model_after_generate: bool = False) -> Tuple[Any]:
+        path_voice = (ref_voice_path or "").strip()
+        if not path_voice and ref_audio is None:
+            raise RuntimeError("Reference audio is required (connect 'ref_audio' or set 'ref_voice_path')")
+
+        if path_voice and ref_audio is not None:
+            print(
+                "ℹ️ [Qwen3-TTS] VoiceClonePrompt: 'ref_voice_path' is set, ignoring the "
+                "connected 'ref_audio'."
+            )
+
+        # A .qvp already *is* the prompt: return it untouched, so no model is
+        # loaded and the saved timbre is reproduced exactly.
+        audio_pair = None
+        if path_voice:
+            path_prompt, audio_pair, path_ref_text, _path_instruct = load_ref_voice(path_voice)
+            if path_prompt is not None:
+                print("🚀 [Qwen3-TTS] VoiceClonePrompt: returning the saved prompt as-is.")
+                return (path_prompt,)
+            ref_text = ref_text or path_ref_text
+            if not (ref_text or "").strip() and not x_vector_only:
+                x_vector_only = True
+                print(
+                    "⚠️ [Qwen3-TTS] VoiceClonePrompt: no ref_text for this audio (no sidecar "
+                    "JSON), using speaker-embedding-only mode. Point at the saved .qvp to "
+                    "keep ICL quality."
+                )
 
         pbar = ProgressBar(3)
 
@@ -1478,8 +1816,11 @@ class VoiceClonePromptNode:
 
         pbar.update_absolute(2, 3, None)
 
-        vcn = VoiceCloneNode()
-        audio_tuple = vcn._audio_tensor_to_tuple(ref_audio)
+        if audio_pair is None:
+            vcn = VoiceCloneNode()
+            audio_tuple = vcn._audio_tensor_to_tuple(ref_audio)
+        else:
+            audio_tuple = audio_pair
 
         prompt_items = model.create_voice_clone_prompt(
             ref_audio=audio_tuple,
@@ -1510,6 +1851,16 @@ class RoleBankNode:
         for i in range(1, 9):
             inputs["optional"][f"role_name_{i}"] = ("STRING", {"default": f"Role{i}"})
             inputs["optional"][f"prompt_{i}"] = ("VOICE_CLONE_PROMPT",)
+            inputs["optional"][f"voice_path_{i}"] = ("STRING", {
+                "default": "",
+                "placeholder": "可选：该角色的 .qvp 或参考音频路径",
+                "tooltip": (
+                    "Per-role voice given as a path instead of a wired prompt. "
+                    "A .qvp is loaded as the prompt directly; an audio file is encoded "
+                    "once by DialogueInference. Overrides prompt_N when both are set. "
+                    "Absolute, <label>/<file>, or a bare name in the voice directories."
+                ),
+            })
             inputs["optional"][f"instruct_{i}"] = ("STRING", {
                 "multiline": True,
                 "default": "",
@@ -1531,15 +1882,24 @@ class RoleBankNode:
     def create_bank(self, **kwargs) -> Tuple[Dict[str, Any]]:
         bank = {}
         for i in range(1, 9):
-            name = kwargs.get(f"role_name_{i}", "").strip()
+            name = (kwargs.get(f"role_name_{i}") or "").strip()
             prompt = kwargs.get(f"prompt_{i}")
-            if not name or prompt is None:
+            path = (kwargs.get(f"voice_path_{i}") or "").strip()
+            # A role needs at least one way to name its voice: a wired prompt or
+            # a path.  A path-only role is resolved later, once
+            # DialogueInference has the Base model (audio needs encoding).
+            if not name or (prompt is None and not path):
                 continue
             card = (kwargs.get(f"instruct_{i}") or "").strip()
+            if path:
+                bank[name] = {"prompt": prompt, "instruct": card, "voice_path": path}
             # Keep the bare prompt for roles without a card so existing
             # workflows (and any consumer expecting a prompt directly) keep
             # working unchanged.
-            bank[name] = {"prompt": prompt, "instruct": card} if card else prompt
+            elif card:
+                bank[name] = {"prompt": prompt, "instruct": card}
+            else:
+                bank[name] = prompt
         return (bank,)
 
 
@@ -1567,6 +1927,19 @@ def unpack_role(role_data: Any) -> Tuple[Any, str]:
         card = role_data.get("instruct", "")
         return single(role_data["prompt"]), (card or "").strip()
     return single(role_data), ""
+
+
+def role_voice_path(role_data: Any) -> str:
+    """Per-role voice path written by ``RoleBankNode``; ``""`` when absent.
+
+    Kept separate from ``unpack_role`` (whose two-value shape is relied on
+    elsewhere) so that a path-only role does not change what existing callers
+    see.  ``unpack_role`` already returns ``(None, card)`` for such a role.
+    """
+    if isinstance(role_data, dict):
+        path = role_data.get("voice_path", "")
+        return path.strip() if isinstance(path, str) else ""
+    return ""
 
 
 class DialogueInferenceNode:
@@ -1642,6 +2015,36 @@ class DialogueInferenceNode:
 
         model = load_qwen_model("Base", model_choice, device, precision, attention, unload_model_after_generate, previous_attention)
 
+        # Per-role voice paths are resolved once per role, now that the Base
+        # model exists: a .qvp needs no model, audio has to be encoded.  Doing
+        # this before the line loop keeps a 200-line script from re-encoding
+        # the same reference audio 200 times.
+        path_prompts: Dict[str, Any] = {}
+        path_voice_cards: Dict[str, str] = {}
+        for role_name, entry in role_bank.items():
+            role_path = role_voice_path(entry)
+            if not role_path:
+                continue
+            role_prompt, role_audio, role_ref_text, role_instruct = load_ref_voice(role_path)
+            if role_prompt is None:
+                role_prompt = prompt_from_audio_or_warn(
+                    model, role_audio, role_ref_text, f"DialogueInference[{role_name}]"
+                )
+            if isinstance(role_prompt, list):
+                if len(role_prompt) > 1:
+                    print(f"⚠️ [Qwen3-TTS] DialogueInference: role '{role_name}' has "
+                          f"{len(role_prompt)} prompts; using the first.")
+                role_prompt = role_prompt[0] if role_prompt else None
+            if role_prompt is None:
+                raise RuntimeError(
+                    f"Could not read a voice prompt for role '{role_name}' from {role_path!r}"
+                )
+            path_prompts[role_name] = role_prompt
+            if role_instruct:
+                path_voice_cards[role_name] = role_instruct
+                print(f"🎭 [Qwen3-TTS] DialogueInference: role '{role_name}' uses the voice "
+                      f"card stored in its .qvp: {role_instruct}")
+
         torch.manual_seed(seed)
         if hasattr(torch, 'xpu') and torch.xpu.is_available():
             torch.xpu.manual_seed_all(seed)
@@ -1691,6 +2094,15 @@ class DialogueInferenceNode:
             # {"prompt": ..., "instruct": ...} wrapper written by RoleBankNode.
             role_data = role_bank[role_name]
             current_prompt, voice_card = unpack_role(role_data)
+            # A per-role voice_path overrides the wired prompt for this role.
+            current_prompt = path_prompts.get(role_name, current_prompt)
+            # The card stored in that .qvp is the voice's baseline; an explicit
+            # instruct_N is this run's refinement.  Keep both, card first.
+            saved_card = path_voice_cards.get(role_name, "")
+            if saved_card:
+                # typed first, card second: merge_instruct(typed, voice_card)
+                # puts the card first in the output either way.
+                voice_card = merge_instruct(voice_card, saved_card)
 
             config = {
                 "pause_linebreak": pause_linebreak,
@@ -1847,7 +2259,14 @@ class SaveVoiceNode:
             },
             "optional": {
                 "audio": ("AUDIO",),
-                "ref_text": ("STRING", {"multiline": True, "default": "", "placeholder": "Reference audio text (optional, but recommended for better quality)"}),
+                "ref_text": ("STRING", {"multiline": True, "default": "", "placeholder": "Reference audio text. Left empty = keep the transcript stored in the prompt"}),
+                "instruct": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "声线卡：音区/音色/语速，如「中高音区，音色清亮，语速中等」",
+                    "tooltip": "Saved into the .qvp so LoadSpeaker / ref_voice_path can restore it, "
+                               "because the prompt itself cannot carry style text.",
+                }),
                 "output_dir": ("STRING", {
                     "default": "",
                     "placeholder": "Empty = models/qwen-tts/voices; relative = under models/qwen-tts; absolute = as-is",
@@ -1868,7 +2287,8 @@ class SaveVoiceNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "SaveVoice: Save voice clone prompt features to disk for later use."
 
-    def save(self, voice_clone_prompt, filename, audio=None, ref_text="", output_dir="", subfolder="", overwrite=True):
+    def save(self, voice_clone_prompt, filename, audio=None, ref_text="", output_dir="", subfolder="",
+             overwrite=True, instruct=""):
         import soundfile as sf
         import json
 
@@ -1907,15 +2327,44 @@ class SaveVoiceNode:
                     "Enable 'overwrite' or choose another name."
                 )
 
-        # 1. Save features (Raw prompt)
-        torch.save(voice_clone_prompt, path_qvp)
+        # 1. Save features, packaged with the text that describes them.
+        #
+        # The .qvp is authoritative: a prompt returned by
+        # create_voice_clone_prompt already carries the transcript it was built
+        # from, and that is what the model conditioned on.  A `ref_text` typed
+        # into this node cannot apply retroactively, so it only fills a gap —
+        # otherwise the sidecar would claim a transcript the prompt never saw.
+        embedded_text = prompt_embedded_ref_text(voice_clone_prompt)
+        saved_text = embedded_text or (ref_text.strip() if ref_text else "")
+        saved_instruct = instruct.strip() if instruct else ""
+
+        if embedded_text and ref_text and ref_text.strip() != embedded_text:
+            print(
+                "⚠️ [Qwen3-TTS] SaveVoice: the 'ref_text' input differs from the transcript "
+                "stored in the prompt; saving the prompt's own text (the one actually "
+                "conditioned on), not the typed one."
+            )
+
+        # Wrapping changes the on-disk layout, so warn rather than quietly
+        # producing a file that older LoadSpeaker builds cannot read.
+        packaged = {
+            "prompt": voice_clone_prompt,
+            "ref_text": saved_text,
+            "instruct": saved_instruct,
+            "source": "SaveVoiceNode",
+            "version": "1.2",
+        }
+        torch.save(packaged, path_qvp)
         print(f"✅ [Qwen3-TTS] Voice features saved to: {path_qvp}")
+        if saved_instruct:
+            print(f"🎭 [Qwen3-TTS] Voice card stored in the .qvp: {saved_instruct}")
 
         # 2. Save metadata (JSON)
         metadata = {
-            "ref_text": ref_text.strip() if ref_text else "",
+            "ref_text": saved_text,
+            "instruct": saved_instruct,
             "source": "SaveVoiceNode",
-            "version": "1.1",
+            "version": "1.2",
             "saved_path": path_wav,
             # Relative to the owning voice directory, so a duplicate filename
             # in another library still resolves to this exact file.
@@ -1981,17 +2430,38 @@ class LoadSpeakerNode:
     def INPUT_TYPES(cls):
         try:
             dirs = get_voice_search_dirs()
-            entries = list_voice_files(dirs)
-            files = build_filename_choices(entries, empty=True)
+            prompt_entries = list_prompt_files(dirs)
+            prompts = [display for display, _ in prompt_entries]
+            # Voices already offered as a .qvp are hidden from the audio list:
+            # the prompt always wins, so a duplicate would only be a trap.
+            audio_files = build_filename_choices(
+                audio_stems_without_prompt(list_voice_files(dirs), prompt_entries),
+                empty=True,
+            )
         except Exception as e:  # browsing must never break node registration
             print(f"⚠️ [Qwen3-TTS] LoadSpeaker: failed to scan voice directories: {e}")
-            files = ["None"]
+            prompts = []
+            audio_files = ["None"]
+
+        # "None" is the default so that workflows which never touch this input
+        # keep loading from 'filename' exactly as before.  Choosing a prompt is
+        # deliberate and then outranks the audio dropdown.
+        prompt_files = ["None"] + prompts
 
         return {
             "required": {
-                "filename": (files, {"tooltip": "Voices found in all scanned directories, shown as <label>/<file>"}),
+                "filename": (audio_files, {
+                    "tooltip": "Reference audio files as <label>/<file>. Voices that have a .qvp "
+                               "are listed in 'prompt_file' instead.",
+                }),
             },
             "optional": {
+                "prompt_file": (prompt_files, {
+                    "default": "None",
+                    "tooltip": "Saved voice prompts (.qvp). When set, it outranks 'filename': the "
+                               "prompt is loaded as-is, with no model load and no re-encoding, so "
+                               "the timbre matches what SaveVoice stored.",
+                }),
                 "directory": ("STRING", {
                     "default": "",
                     "placeholder": "Extra directory to scan (absolute, or relative to models/qwen-tts)",
@@ -1999,8 +2469,10 @@ class LoadSpeakerNode:
                 }),
                 "file_path": ("STRING", {
                     "default": "",
-                    "placeholder": "Optional: absolute path or <label>/<file>; overrides the dropdown",
-                    "tooltip": "Use this to load a voice that is not in the dropdown yet, without reloading",
+                    "placeholder": "Absolute path, <label>/<file>, or a bare voice name — .qvp or audio",
+                    "tooltip": "Overrides both dropdowns. Accepts a saved prompt (.qvp), a reference audio "
+                               "file, or a bare name resolved against the scanned directories "
+                               "(.qvp is preferred over audio).",
                 }),
             },
         }
@@ -2012,9 +2484,19 @@ class LoadSpeakerNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "LoadSpeaker: Load saved WAV audio and its metadata. Fast-loads .qvp features if available."
 
-    def load_speaker(self, filename, directory="", file_path=""):
-        chosen = (file_path or "").strip() or (filename or "").strip()
-        if not chosen or chosen == "None":
+    def load_speaker(self, filename, prompt_file="None", directory="", file_path=""):
+        # Precedence, most explicit first: a hand-typed path, then the saved
+        # prompt dropdown, then the audio dropdown.  The prompt outranks audio
+        # because it carries the exact saved timbre and needs no re-encoding.
+        #
+        # "None" is the placeholder a dropdown carries when nothing was found,
+        # and it is truthy, so it must be filtered out before the `or` chain.
+        def pick(value: str) -> str:
+            text = (value or "").strip()
+            return "" if text == "None" else text
+
+        chosen = pick(file_path) or pick(prompt_file) or pick(filename)
+        if not chosen:
             raise RuntimeError(
                 "No speaker files found to load. Save one with SaveVoice, or point 'file_path' "
                 "at an existing .wav/.qvp pair."
@@ -2024,70 +2506,79 @@ class LoadSpeakerNode:
         chosen_explicit = bool((file_path or "").strip())
         is_bare = "/" not in chosen.replace("\\", "/") and not os.path.isabs(chosen)
 
-        wav_path = None
-        if is_bare and not chosen_explicit:
-            try:
-                wav_path = resolve_bare_name(chosen, search_dirs)
-            except (RuntimeError, FileNotFoundError) as e:
-                raise RuntimeError(
-                    f"{e} Scanned directories: {', '.join(search_dirs) or '(none)'}"
+        # A bare name keeps its historical meaning: resolve against the
+        # default voice directory and refuse to silently pick a same-named
+        # speaker from another library.  A bare *stem* (no extension) is new
+        # and may complete to ".qvp" or an audio extension.
+        try:
+            if is_bare and not chosen_explicit:
+                try:
+                    bare_path = resolve_bare_name(chosen, search_dirs)
+                except FileNotFoundError:
+                    if detect_source_kind(chosen) != SOURCE_STEM:
+                        raise
+                    voice = resolve_voice_source(
+                        chosen, search_dirs, folder_paths.models_dir
+                    )
+                else:
+                    voice = resolve_voice_source(
+                        bare_path, search_dirs, folder_paths.models_dir
+                    )
+            else:
+                voice = resolve_voice_source(
+                    chosen, search_dirs, folder_paths.models_dir
                 )
-        else:
-            try:
-                wav_path = resolve_input_path(chosen, search_dirs, folder_paths.models_dir)
-            except FileNotFoundError as e:
-                raise RuntimeError(
-                    f"{e}. Scanned directories: {', '.join(search_dirs) or '(none)'}"
-                )
+        except (RuntimeError, FileNotFoundError) as e:
+            raise RuntimeError(
+                f"{e} Scanned directories: {', '.join(search_dirs) or '(none)'}"
+            )
 
-        print(f"🎙️ [Qwen3-TTS] LoadSpeaker resolved: {wav_path}")
+        print(f"🎙️ [Qwen3-TTS] LoadSpeaker resolved: {describe_source(voice)}")
 
-        # 1. Load the AUDIO for output/preview
-        import librosa
-        wav, sr = librosa.load(wav_path, sr=None)
-        waveform = torch.from_numpy(wav).unsqueeze(0).unsqueeze(0)
-        audio_preview = {"waveform": waveform, "sample_rate": sr}
-
-        # 2. Automatically load metadata and pre-computed features
-        meta_paths = sibling_metadata_paths(wav_path)
-        qvp_path = meta_paths["qvp"]
-        json_path = meta_paths["json"]
-        
         prompt_items = None
-        ref_text = ""
-        
-        # 2.1 Load metadata from JSON
-        import json
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    metadata = json.load(f)
-                    if not ref_text or not ref_text.strip():
-                        ref_text = metadata.get("ref_text", "")
-                        if ref_text:
-                            print(f"📖 [Qwen3-TTS] Loaded metadata from JSON: {os.path.basename(json_path)}")
-            except Exception as e:
-                print(f"⚠️ [Qwen3-TTS] Failed to load metadata JSON: {e}")
+        ref_text = voice.ref_text
+        audio_preview = None
 
-        # 2.2 Check for pre-computed features (.qvp)
+        if voice.is_prompt:
+            # A .qvp is the prompt itself: no decoding, no re-encoding, so the
+            # saved timbre is reproduced exactly.  A sibling .wav only feeds
+            # the preview output.
+            bundle = load_qvp_bundle(voice.path)
+            prompt_items = bundle["prompt"]
+            # The embedded transcript is what the prompt was built from, so it
+            # describes the prompt better than a hand-typed sidecar value.  The
+            # sidecar only fills a value the .qvp does not carry.
+            ref_text = bundle["ref_text"] or voice.ref_text
+            preview_path = os.path.splitext(voice.path)[0] + ".wav"
+            if os.path.isfile(preview_path):
+                wav, sr = load_audio_pair(preview_path)
+                audio_preview = {
+                    "waveform": torch.from_numpy(wav).unsqueeze(0).unsqueeze(0),
+                    "sample_rate": sr,
+                }
+            else:
+                print(
+                    "ℹ️ [Qwen3-TTS] LoadSpeaker: no sibling .wav for this .qvp; "
+                    "the 'audio' output is empty."
+                )
+            print(f"🚀 [Qwen3-TTS] Fast-loaded pre-computed features from: {os.path.basename(voice.path)}")
+            return (prompt_items, audio_preview, ref_text)
+
+        # Audio input: decode it for the preview, then prefer a sibling .qvp so
+        # the prompt is not rebuilt from scratch when one was saved before.
+        wav, sr = load_audio_pair(voice.path)
+        audio_preview = {
+            "waveform": torch.from_numpy(wav).unsqueeze(0).unsqueeze(0),
+            "sample_rate": sr,
+        }
+
+        meta_paths = sibling_metadata_paths(voice.path)
+        qvp_path = meta_paths["qvp"]
         if os.path.exists(qvp_path):
             try:
-                # Set weights_only=False to allow custom VoiceClonePromptItem class (PyTorch 2.6+ compatibility)
-                if hasattr(torch, 'serialization') and hasattr(torch.serialization, 'add_safe_globals'):
-                    # Optional: Could use add_safe_globals, but weights_only=False is more direct for local files
-                    data = torch.load(qvp_path, map_location="cpu", weights_only=False)
-                else:
-                    data = torch.load(qvp_path, map_location="cpu")
-                
-                # Support legacy packaged format and raw format
-                if isinstance(data, dict) and "prompt" in data:
-                    prompt_items = data["prompt"]
-                    if not ref_text or not ref_text.strip():
-                        ref_text = data.get("ref_text", "")
-                else:
-                    # Raw prompt data
-                    prompt_items = data
-                
+                bundle = load_qvp_bundle(qvp_path)
+                prompt_items = bundle["prompt"]
+                ref_text = bundle["ref_text"] or voice.ref_text
                 print(f"🚀 [Qwen3-TTS] Fast-loaded pre-computed features from: {os.path.basename(qvp_path)}")
             except Exception as e:
                 print(f"⚠️ [Qwen3-TTS] Failed to fast-load .qvp: {e}")
