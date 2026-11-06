@@ -647,3 +647,405 @@ waveform = torch.from_numpy(time_stretch(wav, speed)).float()
 - 教训：只要两种入参形态汇入同一批处理路径，**归一化必须发生在解包处**，
   不能依赖下游「反正都是 prompt」的假设；下游按 `it.ref_code` 索引，
   对形状差异零容忍。
+
+---
+
+## 2026-10-26 · 非语言发声实测：`[laugh]` 类标签完全无效；笑/喊可用指令近似，哭与叹气较弱
+
+**背景**
+
+用户问能否合成笑声、哭声、喊声。代码里既没有对应预设（`EMOTION_PRESETS` 14 项全是情绪），
+也没有发声类标签，需要实证哪些做法真的有效，而不是凭「`instruct` 接受任意自然语言」推断。
+
+**方法**
+
+远程 ComfyUI（`192.168.107.187:8188`，ROCm，RX 7900 XTX），1.7B Base +
+`voices/柳如烟.wav` 音色克隆，`seed=42`、`temperature=0.9`、`batch_size=1`，
+只改 `text` / `instruct`。共 22 个样本，两组提示词（温和 `[style:]` vs 强指令）。
+
+**决定 / 结论**
+
+1. **`[laugh]` / `[cry]` / `[喊]` 等标签完全无效，且不报错。**
+   `[laugh]哈哈哈` 与 `哈哈哈` 的输出**逐采样完全相同**（`max|diff| = 0.0000`，
+   SNR 176.9 dB）；作为对照，仅改 `instruct` 的差异是 −5.0 dB / LSD 9.2 dB。
+   标签在 `parse_rich_text` 就被丢弃，控制台只有一行 dropped 警告。
+2. **笑声可用强指令近似**：`"哈哈哈哈哈"` + `instruct="放声大笑，笑得停不下来，喘不上气"`
+   的声谱图出现**规律性垂直断裂**（每个「哈」一脉冲），
+   jitter 9.01%、shimmer 18.44%，显著高于对照组（jitter 4.44%、shimmer 13.77%）。
+   英文 `hysterical laughter` 同样有效（jitter 6.80%、shimmer 18.05%）。
+   纯拟声 `哈哈哈` 无指令时是**平滑连续**的谐波，属于「把字念出来」，不是笑。
+3. **喊叫最容易**：`啊啊啊！！！！！！` 不加任何指令即出现强断裂与长元音，
+   f0 达 381 Hz。`instruct` 只影响音色细节，不是必需项。
+4. **哭声最弱**：`呜呜呜` + 强指令后 f0 降到 238 Hz、能量集中在 <1000 Hz 低频，
+   上方为气声噪声，但**缺少真抽泣的断续/吸气结构**，听感更接近「哭腔念白」。
+5. **叹气几乎不成立**：`"唉……"` + `instruct="长长地叹了一口气"` 仍带明显谐波，
+   不是纯呼气噪声。
+6. `[style:]` 的描述**确实到达模型**（`instruct` 非空时结果与空 `instruct` 不同），
+   效果强弱取决于文案，与「标签是否被识别」是两件事。
+
+**影响**
+
+- 文档与回答中不得声称支持 `[laugh]` / `[cry]` 标签；当前行为是**静默丢弃**。
+- 推荐写法：把拟声写进台词，并用 `instruct` / `[style:]` 描述发声方式；
+  笑 > 喊 > 哭 > 叹气，按此顺序建立预期。
+- 0.6B CustomVoice 丢弃 `instruct`，只剩「拟声文本」一条路，效果显著更弱。
+- 以上均为声学指标 + 声谱图判断（本地无 GPU，无法试听），
+  **最终验收仍需人耳**；`instruct` 是软约束这一定论（见 2026-10-24 条目）依然适用。
+- 待办（未实施）：把 `[laugh]` 这类发声标签改为转 `style`，或至少把丢弃警告
+  升级为明确提示「该标签不支持，请用 `[style:]` 或写进台词」。
+
+---
+
+## 2026-10-26 · ICL 参考音频不迁移表演；多角色共用一个音色时，声线卡无法制造音色区分
+
+**背景**
+
+正面回答「是否适合短剧配音」需要两块证据，此前都没有：
+
+1. 短剧的关键痛点是**笑声/哭声**这类副语言表演，上一节已证明 `instruct` 只能近似。
+   若 ICL（`x_vector_only=False`，参考音频 + 参考文本）能把表演一起迁移，
+   那就还有一条路。
+2. 短剧必然多角色。`RoleBank` 的 `instruct_{i}` 只能改「怎么说」，
+   改不了「是谁」。需要确认它到底能拉开多少差异。
+
+**方法**
+
+同一远程环境，`seed=42`。第三轮把 S2（强指令笑声）与 S1（尖叫）作为
+`LoadAudio` 参考分别跑 ICL 与 x_vector_only；第四轮跑一段 4 行 3 角色的短剧，
+对比「有声线卡 / 裸 prompt / 声线卡 + 全局 instruct」。
+
+**决定 / 结论**
+
+1. **ICL 不迁移表演。** 以「放声大笑」样本为参考，`I1_icl_laugh` 的声谱图是
+   正常念白的谐波带，参考音频那种规律脉冲条纹**完全没有出现**；
+   `I2`（ICL + instruct）同样没有。x_vector_only（`I3`/`I4`）更只是音色克隆，
+   与预期一致。
+2. **ICL 会污染时长与节奏。** `I5`（以 1.12 s 尖叫为参考）把 7 个字念成 **2.78 s**，
+   而同一句的中性基准是 1.52 s。参考音频越长、越异常，输出时长越离谱。
+3. **多角色声线卡不能制造音色区分。** 三角色短剧（各角色接同一个 `柳如烟` 音色）
+   六段话都落在同一说话人空间：声线卡版 f0 中位 375 Hz，裸 prompt 版 308 Hz，
+   卡 + 全局 instruct 版 308 Hz。差异体现为**同一人的不同念法**，不是三个不同的人。
+4. **对比全部落在同一音色上**（这是被测配置的固有限制，也是结论的关键前提）：
+   音色由参考音频决定，声线卡只作用于 `instruct`。
+   要做多角色，**必须每个角色各自准备音色**（`VoiceClonePrompt` / `LoadSpeaker`）。
+
+**影响**
+
+- 短剧配音的可用范围收窄为：**旁白 / 需要中性或单一情绪的长台词**
+  可用；**多角色对手戏 + 强副语言表演**不可用，只能外部补齐。
+- 不要用 ICL 参考音频去「带情绪」：表演不迁移，反而破坏时长。
+- `docs` 与回答中不得声称「声线卡可区分角色音色」——它只改描述，不改音色。
+- 结论的边界：本机无 GPU，全部判断基于声学指标与声谱图，**未做人耳验收**；
+  且所有样本共用同一个女声参考，「多角色」一项只证明了「声线卡不产生区分」，
+  不能反推「准备多个音色后仍无区分」。
+
+---
+
+## 2026-10-26 · 跨 seed 稳定性修正：笑声/喊声是**可靠**的（6/6），哭与叹气不可靠
+
+**背景**
+
+上一节关于副语言表演的结论来自 `seed=42` 的单个样本，无法回答「能不能用于生产」。
+若笑只在个别 seed 偶发出现，那就不能用；必须测复现率。本条目**修正**上一节
+「哭最弱」的表述——弱不等于随机，但上一节未区分二者。
+
+**方法**
+
+同一远程环境与音色，1.7B Base。5 类发声 × 6 个 seed（1/7/42/123/999/2026）= 30 个样本。
+判定指标：`pulses`（响度包络上 ≥90 ms 间隔的爆发次数，笑声/喊声的客观标志）与 f0 抖动。
+
+**依据**
+
+| 用例 | 各 seed 的 pulses | ≥2 脉冲命中 | 时长范围 |
+|---|---|---|---|
+| `laugh_en`（hysterical laughter） | 4,4,4,4,4,4 | **6/6** | 0.96–1.36 s |
+| `laugh_zh`（放声大笑…） | 2,5,4,4,5,5 | **6/6** | 1.12–1.59 s |
+| `scream`（`啊啊啊！`，无 instruct） | 3,3,2,3,4,3 | **6/6** | 1.52–3.11 s |
+| `cry_zh`（放声大哭…抽泣） | 1,3,1,1,1,1 | **1/6** | 1.20–1.67 s |
+| `sigh`（长长地叹了一口气） | 1,1,1,1,1,1 | **0/6** | 0.64–1.28 s |
+
+**决定 / 结论**
+
+1. **笑声与喊声是可靠的**，不是 seed 偶然：英文笑声脉冲数在所有 6 个 seed 中
+   恒为 4，中文笑声 4–5，说明「规律脉冲串」这一笑声核心特征稳定存在。
+   两者可直接用于生产，只需挑文案与音色。
+2. **哭声不可靠**：只有 1/6 的 seed 出现 ≥2 脉冲，其余是连续低频带
+   （哭腔念白）。上一节「哭最弱」应细化为**情绪基调可给、抽泣事件不可控**。
+3. **叹气在声学上成立但无事件结构**：6/6 都是单个连续气声段，
+   谐波几乎消失、f0 跟踪抖动极大（抖动 55%/71%，说明周期结构已不可靠）。
+   作为「呼气/叹气」使用是有效的，只是不能指望脉冲型断句。
+4. 时长方差较大（喊声 1.52–3.11 s，2 倍差），逐句配音需按 seed 试听挑选。
+
+**影响**
+
+- 生产建议：笑/喊可以内建使用；哭只用情绪底色，**不要把抽泣当作可编排事件**；
+  叹气仅当氛围音。
+- 需要固定成品时，**按 seed 挑样**是可行手段（同一 seed 的可复现性已验证）。
+- 待办（未实施）：把「笑/喊」正式纳入预设或标签体系（当前 `[laugh]` 仍被静默丢弃），
+  并为它们加跨 seed 回归测试，避免以后改文案时悄悄退化。
+
+---
+
+## 2026-10-26 · 同 seed 完全确定性：同输入重跑得到**逐采样相同**的音频
+
+**背景**
+
+做副语言听感对照表时发现多组样本指标完全相同，需要确认是重复生成还是巧合。
+这一点直接影响「能否按 seed 锁定成品」这一生产手段是否成立。
+
+**依据**
+
+60 个样本两两比对（长度差 ≤8 采样、逐采样计算 `max|diff|`），得到 6 对**完全相同**：
+
+| 对 | max\|diff\| |
+|---|---|
+| `A1_laugh_raw` == `E1_laugh_tag` | 0.00e+00 |
+| `S2_laugh_zh` == `laugh_zh_s42` | 0.00e+00 |
+| `S3_cry_zh` == `cry_zh_s42` | 0.00e+00 |
+| `S5_laugh_en` == `laugh_en_s42` | 0.00e+00 |
+| `S7_sigh_zh` == `sigh_s42` | 0.00e+00 |
+| `S8_scream_raw` == `scream_s42` | 0.00e+00 |
+
+**决定 / 结论**
+
+1. **同 seed + 同文本 + 同 instruct + 同模型 → 逐采样完全一致**（没有任何随机残差）。
+   这不是 bug，是 `torch.manual_seed` + 确定性采样路径的预期行为。
+2. 因此「按 seed 挑样并锁定」是**可靠的生产手段**，不是碰运气。
+3. `A1 == E1` 这一对（`哈哈哈` vs `[laugh]哈哈哈`）同时是上一节
+   「`[laugh]` 被静默丢弃」的**最强证据**——两者输入不同而输出逐采样相同。
+
+**影响**
+
+- 听感对照表里必须标注重复项，否则会让试听者重复劳动（已在
+  `paralinguistic-ab.html` 中标注「与 #08 相同，可跳过」）。
+- 跨 seed 的差异才是「真实的不确定性」；同一 seed 内的差异只可能来自
+  代码/模型/参数变化，可作为**回归检测**：改代码后若同 seed 输出变了，
+  说明行为发生了非预期变化。
+- 待办（未实施）：可用「同 seed 输出哈希」作为副语言能力回归测试的基线。
+
+---
+
+## 2026-10-26 · 人耳验收推翻 `pulses` 判据：哭完全不存在；`aper` 才是有效指标
+
+**背景**
+
+此前三条结论都建立在声学代理指标上，从未经人耳。用户试听对照表后给出判断：
+03（`S5_laugh_en`）「像冷笑」，05（`S2_laugh_zh`）「有点像是在笑」，
+14/15/16/17（全部 `cry_zh_*`）「**完全是在读文本**」。
+
+**决定 / 结论（推翻上一节）**
+
+1. **`pulses` 不是副语言表演的判据，已废弃。** 14 的 pulses=3 只是「呜呜呜」
+   被拆成三段念，而非抽泣。以 pulses ≥2 判定「1/6 seed 成功」是**伪成功**。
+   上一节「哭只有 1/6 成功」应改为：**哭在 6/6 的 seed 上都不成立，从未成功**。
+2. **`aper`（响度大时的不周期度）与听感一致**，可作替代指标：
+
+   | 分组 | 用户判断 | aper 范围 |
+   |---|---|---|
+   | `cry_zh_*` 共 6 条 | 读文本 | 0.032 – 0.087 |
+   | 笑声 3 条 | 冷笑 / 有点在笑 | 0.090 – 0.189 |
+   | `Z0_control` | 普通念白 | 0.095 |
+
+   念读的周期性明显更强（谐波清晰），真笑混入气声摩擦。
+3. **笑声方向正确但强度不足**：05 只是「有点在笑」。加压实验（`L1`–`L5`）
+   把 aper 推到 0.124–0.239，`L3`（笑得呛到）最高 0.239 —— **效果未知，待试听**。
+4. **哭泣路线判定为不可行**：加压后的 `C1`（抽泣，气口全写进文本）aper=0.037，
+   与读文本的 0.032–0.033 无法区分。唯一沾边的是 `C3`（哽咽**说台词**而非纯拟声，
+   aper=0.137）——这说明**哭泣要靠「带词的哽咽」而非「呜呜声」**，且仍未经试听。
+5. 指标与听感在**已听过的 8 个样本**上一致，但这不等于对未听样本也准；
+   新样本必须重新试听验证。
+
+**影响**
+
+- 文档与回答中不得再用 `pulses` 论证表演存在；相关结论改为「待试听」。
+- 哭泣：只保留「哽咽说台词」一条线索，其余（纯拟声、加重抽泣文案）判死。
+- **教训**：声学代理指标只能用于**排序候选**，不能用于**判定效果成立**。
+  此前三次「实测结论」中有一次（哭 1/6）是错的，根因是把「能量爆发」
+  误当成「表演事件」。今后凡涉及听感，必须以人耳为准并写明「未经试听」。
+- 对照表已升级为 v3（`docs` 同级产物 `paralinguistic-ab.html`），
+  主指标换成 aper，并把用户判断逐条标注在表内。
+
+---
+
+## 2026-11-06 · 音色输入支持路径，`.qvp` 升为一等公民
+
+**背景**
+
+用户提出「音色输入支持按照路径吗」，并明确指出应该填的是 `.qvp` 路径。核查代码后确认
+这是真实缺口，而非误解：
+
+- `voice_store.AUDIO_EXTENSIONS` 不含 `.qvp`，下拉列表从不列出 `.qvp`；
+- `LoadSpeakerNode.load_speaker` 解析出路径后直接 `librosa.load(path)`，`.qvp` 是
+  `torch.save` 的二进制，必然抛异常；
+- `.qvp` 只在 `sibling_metadata_paths()` 里被当作「音频旁边的隐式缓存」，
+  从来不是可指定的输入；
+- 其余节点只有 `AUDIO` / `VOICE_CLONE_PROMPT` 连线，无法按路径指定音色。
+
+**决定**
+
+1. **路径是一等输入**，参数名统一为 `ref_voice_path`（不叫 `ref_wav_path`，因为它同时接受
+   `.qvp` 与音频）：`VoiceClone` / `EmotionalTTS` / `VoiceClonePrompt` 各加一个；
+   `RoleBankNode` 加 `voice_path_1..8` 供 `DialogueInference` 按角色使用。
+2. **路径非空即生效，忽略对应连线**，并打印 `ℹ️ ... ignoring the connected ...`。
+   选「路径优先」而不是「连线优先」：路径是每次运行手动填的显式意图，
+   而连线可能是从别的音色工作流复制过来的残留，静默沿用会让用户以为换了音色其实没换。
+3. **`.qvp` 与音频是两条不同路径，不互相兜底**：
+   - 指向 `.qvp` → `torch.load` 直接得到 prompt，不加载模型、不重编码；
+   - 指向音频 → 解码后 `create_voice_clone_prompt`；
+   - 指向音频且旁边有同名 `.qvp` → `LoadSpeaker` 仍读 `.qvp`（保持旧行为）；
+   - 指向 `.qvp` 绝不会回落到同名音频，否则保存时的音色会被无声替换。
+4. **裸名解析顺序 `.qvp` → 音频**，与第 3 条一致。
+5. **缺 `ref_text` 时降级而非报错**：路径输入没有地方写参考文本，无同名 `.json` 时
+   改用 `x_vector_only`（仅说话人向量）并打印提示。上游在 ICL 模式下会直接抛
+   `ref_text is required`，对路径输入过于生硬；但必须提示，否则用户以为拿到了完整 ICL 质量。
+6. **`VoiceClonePromptNode.ref_audio` 从 required 改为 optional**：只填路径时节点才可能执行。
+   已连线的工作流行为不变。
+7. `unpack_role()` 保持两返回值不变，新增 `role_voice_path()` 读取路径。
+   `tests/test_dialogue_markup.py` 用 AST 抽取该函数并要求两元组，改签名会破坏测试契约。
+
+**影响**
+
+- `voice_store.py` 新增 `PROMPT_EXTENSIONS` / `VOICE_EXTENSIONS`、`VoiceSource`、
+  `detect_source_kind()`、`describe_source()`、`resolve_voice_source()`。
+- `nodes.py` 新增 `load_qvp_prompt()` / `load_audio_pair()` / `load_ref_voice()` /
+  `prompt_from_audio_or_warn()` / `role_voice_path()`，五个节点共用同一套解析。
+- 每个角色只在模型加载后解析一次路径；200 行脚本不会重复编码同一段参考音频。
+- 单测 40 → 57（`test_voice_store.py`），另加 6 个 `RoleVoicePathTests`。
+- **已知遗留（非本次引入）**：`tests/test_cuda_compatibility.py` 用空的假 `numpy` 模块加载
+  `nodes.py`，而 `VoiceCloneNode._audio_tensor_to_tuple` 的 `np.ndarray` 注解在导入期求值，
+  导致 14 个 error。HEAD 上同样存在，错误集合逐行 diff 一致。本次新增注解一律写成字符串形式，
+  没有加重它，但该测试本身需要单独修（改 `from __future__ import annotations` 或补 stub）。
+
+---
+
+## 2026-11-06 · `.qvp` 增加独立下拉 `prompt_file`，优先级高于音频下拉
+
+**背景**
+
+上一轮的路径输入解决了「手填 `.qvp` 能加载」，但 `LoadSpeaker` 的下拉仍只列音频
+（`list_voice_files` 只看 `AUDIO_EXTENSIONS`），于是**只有 `.qvp`、没有同名 wav 的音色
+根本选不到**，必须手敲路径。用户要求「加一个下拉框选择 qvp 文件，优先级以 qvp 优先」。
+
+**决定**
+
+1. **新增独立输入 `prompt_file`**，而不是把 `.qvp` 混进原 `filename` 列表。
+   混进去会让同一个音色出现 `voices/hero.wav` 与 `voices/hero.qvp` 两条，
+   用户无从判断哪条生效，而答案恒为 `.qvp`。
+2. **`filename` 隐藏被 `.qvp` 覆盖的音色**（`audio_stems_without_prompt`），
+   两个下拉之间不出现同一音色的重复条目。
+3. **优先级 `file_path` > `prompt_file` > `filename`**。
+4. **`prompt_file` 放在 optional 且默认 `"None"`**，不作为 required 的第二个下拉。
+   ComfyUI 保存旧工作流时只记 required 的 `widgets_values`；新增 required 下拉会让旧工作流
+   少一个值、回落到第一项，等于静默改掉用户已保存的音色。optional + 默认 `"None"`
+   则让旧工作流行为逐字不变。
+5. **`"None"` 必须显式过滤**。它是字符串、truthy，若直接参与 `a or b or c` 会把
+   音频下拉整个吞掉——这个坑在实现时踩到过，已有测试覆盖（`test_no_prompts_means_audio_unchanged`
+   与优先级实测）。
+
+**影响**
+
+- `voice_store.py`：`list_voice_files(extensions=...)` 增加可选取值（默认仍为音频，
+  11 个既有调用点行为不变）；新增 `list_prompt_files()` 与 `audio_stems_without_prompt(audio, prompts)`。
+- **`audio_stems_without_prompt` 最初只收一个参数**，把音频列表自己当来源找 `.qvp`，
+  而音频列表里永远没有 `.qvp`，过滤完全不生效。单测直接抓到（3 个 failure），
+  改为显式传入两个列表。
+- 单测 57 → 65，新增 `ListPromptFilesTests`（7 项）覆盖：`.qvp` 只进 prompt 下拉、
+  音频下拉默认不变、被覆盖的音色被隐藏、无 `.qvp` 时音频不变、两下拉无重复、
+  递归子目录、目录不存在。
+- 实测 `tests/data`：`prompt_file = ['data/柳如烟.qvp']`，
+  `filename = ['data/toonflow_qwen3tts_00004.flac']`，`柳如烟.wav` 因有同名 `.qvp` 被隐藏。
+
+---
+
+## 2026-11-06 · `.qvp` 打包自身 `ref_text` 与 `instruct`，成为音色的权威来源
+
+**背景**
+
+用户问「`.qvp` 有创建音色使用的提示词，为什么克隆还要加 `instruct`」。核查后确认前提不成立：
+
+- `.qvp` 是 `VoiceClonePromptItem` 的序列化，字段只有
+  `ref_code` / `ref_spk_embedding` / `x_vector_only_mode` / `icl_mode` / `ref_text`
+  （`qwen_tts/inference/qwen3_tts_model.py:41-52`），**没有 `instruct`**；
+- `SaveVoiceNode.save()` 只做 `torch.save(voice_clone_prompt, path_qvp)`，
+  风格描述从未落盘；
+- 两份 `ref_text` 来源不同：`.qvp` 里那份是 prompt 构建时用的转写（ICL 对齐用，
+  `generate_icl_prompt`），`.json` 里那份是保存时手填的值，二者可以不一致。
+
+用 `pickletools` 反汇编 `tests/data/柳如烟.qvp` 直接验证：`archive/data.pkl` 中
+出现的是上述五字段（含 `ref_text`），`grep -a instruct` 无匹配。
+
+**决定**
+
+1. **`.qvp` 改成 package dict**：`{"prompt", "ref_text", "instruct", "source", "version": "1.2"}`，
+   把风格描述随音色一起存下来。旧格式（裸 prompt）继续可读，缺失字段回落到 `.json`。
+2. **保存时以 `.qvp` 内嵌值为准**。`prompt_embedded_ref_text()` 从
+   `VoiceClonePromptItem.ref_text` 取转写；手填的 `ref_text` 只在 prompt 没有转写时写入。
+   **理由**：那份转写是模型实际条件过的文本，手填值无法追溯生效；若直接采用手填值，
+   `.json` 会声称一个 prompt 从未见过的转写。两者不同时打印警告。
+3. **`SaveVoice` 新增 `instruct` 输入**，写入 `.qvp` 与 `.json`。
+4. **读取优先级统一**：`.qvp` 内嵌值 → 同名 `.json` → 空。
+   `load_ref_voice()` 增加第 4 个返回值 `instruct`，`VoiceSource` 增加 `instruct` 字段。
+5. **instruct 的回填语义是「填空」而非「覆盖」**：节点上显式填写优先，
+   `.qvp` 里的声线卡只在节点为空时生效；`DialogueInference` 同理，
+   `RoleBank` 的 `instruct_N` 优先于路径对应的卡。
+   选这个方向是因为显式输入代表本次运行的意图，而卡是历史默认值。
+
+**影响**
+
+- `nodes.py`：新增 `read_qvp()` / `unpack_qvp()` / `load_qvp_bundle()` /
+  `prompt_embedded_ref_text()` / `prompt_embedded_instruct()`；
+  `load_qvp_prompt()` 保留为兼容包装。
+- `voice_store.py`：`VoiceSource` 增加 `instruct`；`_read_ref_text` 改为 `_read_sidecar`
+  返回二元组，新增 `_source()` 统一构造（4 处调用点）。
+- **向后不兼容风险**：`.qvp` 由裸 prompt 变为 dict。本仓库的读取端（`unpack_qvp`）
+  两种都能处理，但**更旧的 LoadSpeaker 构建读到新文件会拿到整个 dict 当 prompt**。
+  版本号写进文件是为了将来能分辨；若确认不再需要兼容旧构建，可去掉这层顾虑。
+- 单测 217 → 230，新增 `QvpPackagingTests`（13 项）覆盖：旧格式无文本、package 拆分、
+  非字符串字段容错、内嵌转写提取（含批量歧义时返回空）、内嵌 instruct 仅来自 package、
+  以及「内嵌优先于手填」的保存语义。
+- 实测（`tests/data/柳如烟.qvp`）：旧格式解析出 `ref_text` 非空、`instruct` 为空；
+  构造的新 package 能正确取回两者。
+
+---
+
+## 2026-11-06 · `.qvp` 的声线卡与手填 instruct 改为拼接（不覆盖）
+
+**背景**
+
+上一轮把 `.qvp` 的 `instruct` 做成「填空」语义（节点为空才生效）。用户要求改为**拼接**：
+两者都要进入最终的 `instruct`。
+
+**决定**
+
+1. 新增 `merge_instruct(typed, voice_card)`，输出顺序固定为 **卡在前、手填在后**：
+
+   ```text
+   中高音区，音色清亮，这一句要压低声音
+   ```
+
+   - 卡在前：它是音色的基线（音区/音色/语速）；
+   - 手填在后：本次运行的细化，放在最后（模型对靠后描述权重更高）；
+   - 分隔符用全角「，」，与 `build_emotion_instruct` 一致。
+
+2. **重叠不重复拼接**：`text == card`、`card in text`、`text in card` 三种情况直接返回较长的那个，
+   避免「中高音区，中高音区」。这是最可能的误用（用户把卡又抄了一遍）。
+
+3. 三个使用点统一：
+   - `VoiceCloneNode`：`instruct = merge_instruct(instruct, path_instruct)`；
+   - `EmotionalTTSNode`：同上，但**必须在 `build_segment_plans()` 之前**完成；
+   - `DialogueInferenceNode`：`voice_card = merge_instruct(instruct_N, saved_card)`。
+
+**影响**
+
+- **修复一个上一轮引入的真 bug**：`EmotionalTTSNode` 原先在 `plans` 已构建之后才合并，
+  而 `plans` 把 `instruct` 烘焙进每个 segment 的文本，所以合并结果**从未进入生成**。
+  实测确认修复无效时两段文本都进不去、修复后都进得去。为此新增 `load_voice_card()`：
+  只解析路径并读卡，不解码音频、不加载模型，供「模型之前就要用卡」的场景调用。
+- **`merge_instruct` 不再引用模块级常量**：最初用 `VOICE_CARD_SEPARATOR`，但
+  `tests/test_dialogue_markup.py` 通过 AST 抽取函数并只注入有限命名空间，
+  常量不在其中，测试直接报 `NameError`。改为字面量。
+  **教训**：`nodes.py` 里凡是需要被 AST 抽取测试的函数，不能依赖模块级名字。
+- 单测 230 → 239，新增 `MergeInstructTests`（9 项）：单独卡、单独手填、两者拼接顺序、
+  完全重复、互相包含、空白、双空、分隔符。
+- 端到端实测：`build_segment_plans(parse_rich_text("第一句。[sad]第二句。"), extra_instruct=merge_instruct(...))`
+  的两个 segment 均同时包含卡与手填文本，且情感预设仍在最前。
